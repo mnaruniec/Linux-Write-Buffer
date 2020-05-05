@@ -997,6 +997,12 @@ static inline int build_open_flags(int flags, umode_t mode, struct open_flags *o
 		acc_mode = 0;
 	}
 
+	/*
+	 * Using these two flags together is unsupported.
+	 */
+	if ((flags & O_APPEND) && (flags & O_BUFFERED_WRITE))
+		return -EINVAL;
+
 	op->open_flag = flags;
 
 	/* O_TRUNC implies we need access checks for write permissions */
@@ -1059,7 +1065,7 @@ struct file *filp_open(const char *filename, int flags, umode_t mode)
 {
 	struct filename *name = getname_kernel(filename);
 	struct file *file = ERR_CAST(name);
-	
+
 	if (!IS_ERR(name)) {
 		file = file_open_name(name, flags, mode);
 		putname(name);

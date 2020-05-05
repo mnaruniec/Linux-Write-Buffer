@@ -37,6 +37,9 @@ static int setfl(int fd, struct file * filp, unsigned long arg)
 	struct inode * inode = file_inode(filp);
 	int error = 0;
 
+	if ((filp->f_flags & O_BUFFERED_WRITE) && (arg & O_APPEND))
+		return -EPERM;
+
 	/*
 	 * O_APPEND cannot be cleared if the file is marked as append-only
 	 * and the file is open for write.
@@ -446,7 +449,7 @@ static int check_fcntl_cmd(unsigned cmd)
 }
 
 SYSCALL_DEFINE3(fcntl, unsigned int, fd, unsigned int, cmd, unsigned long, arg)
-{	
+{
 	struct fd f = fdget_raw(fd);
 	long err = -EBADF;
 
@@ -471,7 +474,7 @@ out:
 #if BITS_PER_LONG == 32
 SYSCALL_DEFINE3(fcntl64, unsigned int, fd, unsigned int, cmd,
 		unsigned long, arg)
-{	
+{
 	void __user *argp = (void __user *)arg;
 	struct fd f = fdget_raw(fd);
 	struct flock64 flock;
@@ -488,7 +491,7 @@ SYSCALL_DEFINE3(fcntl64, unsigned int, fd, unsigned int, cmd,
 	err = security_file_fcntl(f.file, cmd, arg);
 	if (err)
 		goto out1;
-	
+
 	switch (cmd) {
 	case F_GETLK64:
 	case F_OFD_GETLK:
@@ -738,8 +741,8 @@ static void send_sigio_to_task(struct task_struct *p,
 		kernel_siginfo_t si;
 		default:
 			/* Queue a rt signal with the appropriate fd as its
-			   value.  We use SI_SIGIO as the source, not 
-			   SI_KERNEL, since kernel signals always get 
+			   value.  We use SI_SIGIO as the source, not
+			   SI_KERNEL, since kernel signals always get
 			   delivered even if we can't queue.  Failure to
 			   queue in this case _should_ be reported; we fall
 			   back to SIGIO in that case. --sct */
@@ -780,7 +783,7 @@ void send_sigio(struct fown_struct *fown, int fd, int band)
 	struct task_struct *p;
 	enum pid_type type;
 	struct pid *pid;
-	
+
 	read_lock(&fown->lock);
 
 	type = fown->pid_type;
@@ -818,7 +821,7 @@ int send_sigurg(struct fown_struct *fown)
 	enum pid_type type;
 	struct pid *pid;
 	int ret = 0;
-	
+
 	read_lock(&fown->lock);
 
 	type = fown->pid_type;
@@ -1031,7 +1034,7 @@ static int __init fcntl_init(void)
 	 * Exceptions: O_NONBLOCK is a two bit define on parisc; O_NDELAY
 	 * is defined as O_NONBLOCK on some platforms and not on others.
 	 */
-	BUILD_BUG_ON(21 - 1 /* for O_RDONLY being 0 */ !=
+	BUILD_BUG_ON(22 - 1 /* for O_RDONLY being 0 */ !=
 		HWEIGHT32(
 			(VALID_OPEN_FLAGS & ~(O_NONBLOCK | O_NDELAY)) |
 			__FMODE_EXEC | __FMODE_NONOTIFY));
