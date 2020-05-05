@@ -6,6 +6,7 @@
 #include <linux/kernel.h>
 #include <linux/file.h>
 #include <linux/fs.h>
+#include <linux/list.h>
 #include <linux/slab.h>
 #include <linux/export.h>
 #include <linux/namei.h>
@@ -198,6 +199,19 @@ int vfs_fsync_range(struct file *file, loff_t start, loff_t end, int datasync)
 }
 EXPORT_SYMBOL(vfs_fsync_range);
 
+static int flush_buffer(struct file *file, struct write_buffer *write_buffer)
+{
+	// TODO
+	return 0;
+}
+
+// TODO might move
+inline void free_write_buffer(struct write_buffer *write_buffer)
+{
+	kfree(write_buffer->buffer);
+	write_buffer->buffer = NULL;
+}
+
 /**
  * vfs_fsync - perform a fsync or fdatasync on a file
  * @file:		file to sync
@@ -208,6 +222,34 @@ EXPORT_SYMBOL(vfs_fsync_range);
  */
 int vfs_fsync(struct file *file, int datasync)
 {
+	int ret = -EINTR;
+	struct write_buffer *entry;
+
+	if (file->f_flags & O_BUFFERED_WRITE) {
+		if (!mutex_lock_interruptible(&file->f_buffer_mutex)) {
+			struct list_head *pos;
+			struct list_head *n;
+
+			list_for_each_safe(pos, n, &file->f_buffer_list) {
+				entry = list_entry(
+					pos, struct write_buffer, buffer_list
+				);
+				ret = flush_buffer(file, entry);
+
+				if (ret < 0)
+					break;
+
+				free_write_buffer(entry);
+				list_del(pos);
+			}
+
+			mutex_unlock(&file->f_buffer_mutex);
+		}
+	}
+
+	if (ret < 0)
+		return ret;
+
 	return vfs_fsync_range(file, 0, LLONG_MAX, datasync);
 }
 EXPORT_SYMBOL(vfs_fsync);
