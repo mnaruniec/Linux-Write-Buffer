@@ -9,6 +9,7 @@ struct super_block;
 struct file_system_type;
 struct iomap;
 struct iomap_ops;
+struct fd;
 struct linux_binprm;
 struct path;
 struct mount;
@@ -125,6 +126,8 @@ extern struct file *do_filp_open(int dfd, struct filename *pathname,
 extern struct file *do_file_open_root(struct dentry *, struct vfsmount *,
 		const char *, const struct open_flags *);
 
+long do_sys_ftruncate_sync(unsigned int fd, loff_t length, int small,
+		struct fd *sync_fd);
 long do_sys_ftruncate(unsigned int fd, loff_t length, int small);
 long do_faccessat(int dfd, const char __user *filename, int mode);
 int do_fchmodat(int dfd, const char __user *filename, umode_t mode);

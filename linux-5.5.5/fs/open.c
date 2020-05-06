@@ -152,7 +152,49 @@ COMPAT_SYSCALL_DEFINE2(truncate, const char __user *, path, compat_off_t, length
 }
 #endif
 
-long do_sys_ftruncate(unsigned int fd, loff_t length, int small)
+// TODO move
+inline void init_write_buffer(struct write_buffer *wb)
+{
+	INIT_LIST_HEAD(&wb->buffer_list);
+	wb->buffer = NULL;
+	wb->size = 0;
+	wb->offset = 0;
+	wb->flags = 0;
+}
+
+static int append_ftruncate_buffer(struct file *file, loff_t length)
+{
+	int ret = -ENOMEM;
+	struct write_buffer *wb =
+		kmalloc(sizeof(struct write_buffer), GFP_KERNEL);
+
+	if (!wb)
+		goto out;
+
+	init_write_buffer(wb);
+	wb->offset = length;
+
+	ret = -ERESTARTSYS;
+	if (mutex_lock_interruptible(&file->f_buffer_mutex))
+		goto out_free_wb;
+
+	list_add_tail(&wb->buffer_list, &file->f_buffer_list);
+
+	ret = 0;
+
+	mutex_unlock(&file->f_buffer_mutex);
+out:
+	return ret;
+out_free_wb:
+	kfree(wb);
+	goto out;
+}
+
+/*
+ * sync_fd is NULL for normal ftruncate, non-NULL for fsync with buffers.
+ */
+long do_sys_ftruncate_sync(unsigned int fd, loff_t length, int small,
+				struct fd *sync_fd)
 {
 	struct inode *inode;
 	struct dentry *dentry;
@@ -163,7 +205,9 @@ long do_sys_ftruncate(unsigned int fd, loff_t length, int small)
 	if (length < 0)
 		goto out;
 	error = -EBADF;
-	f = fdget(fd);
+
+	f = sync_fd ? *sync_fd : fdget(fd);
+
 	if (!f.file)
 		goto out;
 
@@ -182,6 +226,11 @@ long do_sys_ftruncate(unsigned int fd, loff_t length, int small)
 	if (small && length > MAX_NON_LFS)
 		goto out_putf;
 
+	if (!sync_fd && f.file->f_flags & O_BUFFERED_WRITE) {
+		error = append_ftruncate_buffer(f.file, length);
+		goto out_putf;
+	}
+
 	error = -EPERM;
 	/* Check IS_APPEND on real upper inode */
 	if (IS_APPEND(file_inode(f.file)))
@@ -195,9 +244,15 @@ long do_sys_ftruncate(unsigned int fd, loff_t length, int small)
 		error = do_truncate(dentry, length, ATTR_MTIME|ATTR_CTIME, f.file);
 	sb_end_write(inode->i_sb);
 out_putf:
-	fdput(f);
+	if (!sync_fd)
+		fdput(f);
 out:
 	return error;
+}
+
+long do_sys_ftruncate(unsigned int fd, loff_t length, int small)
+{
+	return do_sys_ftruncate_sync(fd, length, small, NULL);
 }
 
 SYSCALL_DEFINE2(ftruncate, unsigned int, fd, unsigned long, length)

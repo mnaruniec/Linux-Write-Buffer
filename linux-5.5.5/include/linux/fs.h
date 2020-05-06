@@ -52,6 +52,7 @@ struct hd_geometry;
 struct iovec;
 struct kiocb;
 struct kobject;
+struct kvec;
 struct pipe_inode_info;
 struct poll_table_struct;
 struct kstatfs;
@@ -935,7 +936,8 @@ static inline int ra_has_index(struct file_ra_state *ra, pgoff_t index)
 struct write_buffer {
 	struct list_head buffer_list;
 	char *buffer;
-	size_t size;
+	size_t size;	/* If 0 then truncate to offset*/
+	loff_t offset;
 	rwf_t flags;
 };
 
@@ -1947,6 +1949,10 @@ extern int vfs_dedupe_file_range(struct file *file,
 extern loff_t vfs_dedupe_file_range_one(struct file *src_file, loff_t src_pos,
 					struct file *dst_file, loff_t dst_pos,
 					loff_t len, unsigned int remap_flags);
+
+extern ssize_t kernel_vfs_writev_single(struct file *file,
+					const struct kvec *vec,
+					loff_t *pos, rwf_t flags);
 
 
 struct super_operations {

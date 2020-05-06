@@ -199,17 +199,61 @@ int vfs_fsync_range(struct file *file, loff_t start, loff_t end, int datasync)
 }
 EXPORT_SYMBOL(vfs_fsync_range);
 
-static int flush_buffer(struct file *file, struct write_buffer *write_buffer)
+static int flush_buffer(struct fd *fd, struct write_buffer *write_buffer)
 {
-	// TODO
-	return 0;
+	int ret = 0;
+
+	if (write_buffer->size <= 0) {
+		ret = do_sys_ftruncate_sync(
+			(unsigned int)-1, write_buffer->offset, 0, fd
+		);
+	} else {
+		// TODO
+	}
+
+	return ret;
 }
 
 // TODO might move
-inline void free_write_buffer(struct write_buffer *write_buffer)
+inline void delete_write_buffer(struct write_buffer *write_buffer)
 {
+	list_del(&write_buffer->buffer_list);
 	kfree(write_buffer->buffer);
-	write_buffer->buffer = NULL;
+	kfree(write_buffer);
+}
+
+static int fsync_flush_buffers(struct fd *fd)
+{
+	int ret = 0;
+
+	struct write_buffer *entry;
+	struct list_head *pos;
+	struct list_head *n;
+
+	struct file *file = fd->file;
+
+	if (file->f_flags & O_BUFFERED_WRITE) {
+		ret = -ERESTARTSYS;
+		if (!mutex_lock_interruptible(&file->f_buffer_mutex)) {
+			ret = 0;
+
+			list_for_each_safe(pos, n, &file->f_buffer_list) {
+				entry = list_entry(
+					pos, struct write_buffer, buffer_list
+				);
+
+				ret = flush_buffer(fd, entry);
+				if (ret < 0)
+					break;
+
+				delete_write_buffer(entry);
+			}
+
+			mutex_unlock(&file->f_buffer_mutex);
+		}
+	}
+
+	return ret;
 }
 
 /**
@@ -222,34 +266,6 @@ inline void free_write_buffer(struct write_buffer *write_buffer)
  */
 int vfs_fsync(struct file *file, int datasync)
 {
-	int ret = -EINTR;
-	struct write_buffer *entry;
-
-	if (file->f_flags & O_BUFFERED_WRITE) {
-		if (!mutex_lock_interruptible(&file->f_buffer_mutex)) {
-			struct list_head *pos;
-			struct list_head *n;
-
-			list_for_each_safe(pos, n, &file->f_buffer_list) {
-				entry = list_entry(
-					pos, struct write_buffer, buffer_list
-				);
-				ret = flush_buffer(file, entry);
-
-				if (ret < 0)
-					break;
-
-				free_write_buffer(entry);
-				list_del(pos);
-			}
-
-			mutex_unlock(&file->f_buffer_mutex);
-		}
-	}
-
-	if (ret < 0)
-		return ret;
-
 	return vfs_fsync_range(file, 0, LLONG_MAX, datasync);
 }
 EXPORT_SYMBOL(vfs_fsync);
@@ -260,7 +276,9 @@ static int do_fsync(unsigned int fd, int datasync)
 	int ret = -EBADF;
 
 	if (f.file) {
-		ret = vfs_fsync(f.file, datasync);
+		ret = datasync ? 0 : fsync_flush_buffers(&f);
+		if (ret >= 0)
+			ret = vfs_fsync(f.file, datasync);
 		fdput(f);
 	}
 	return ret;

@@ -661,7 +661,7 @@ ssize_t ksys_pwrite64(unsigned int fd, const char __user *buf,
 	f = fdget(fd);
 	if (f.file) {
 		ret = -ESPIPE;
-		if (f.file->f_mode & FMODE_PWRITE)  
+		if (f.file->f_mode & FMODE_PWRITE)
 			ret = vfs_write(f.file, buf, count, &pos);
 		fdput(f);
 	}
@@ -997,6 +997,27 @@ ssize_t vfs_readv(struct file *file, const struct iovec __user *vec,
 		ret = do_iter_read(file, &iter, pos, flags);
 		kfree(iov);
 	}
+
+	return ret;
+}
+
+ssize_t kernel_vfs_writev_single(struct file *file, const struct kvec *vec,
+		   loff_t *pos, rwf_t flags)
+{
+	struct iov_iter iter;
+	mm_segment_t old_fs;
+	ssize_t ret;
+
+	old_fs = get_fs();
+	set_fs(KERNEL_DS);
+
+	iov_iter_kvec(&iter, WRITE, vec, 1, vec->iov_len);
+
+	file_start_write(file);
+	ret = do_iter_write(file, &iter, pos, flags);
+	file_end_write(file);
+
+	set_fs(old_fs);
 
 	return ret;
 }
