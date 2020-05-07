@@ -262,6 +262,9 @@ static int fsync_flush_buffers(struct fd *fd)
 				delete_write_buffer(entry);
 			}
 
+			file->f_buffer_end = 0;
+			file->f_buffer_truncated = 0;
+
 			mutex_unlock(&file->f_buffer_mutex);
 		}
 	}

@@ -170,9 +170,11 @@ static int append_ftruncate_buffer(struct file *file, loff_t length)
 
 	list_add_tail(&wb->buffer_list, &file->f_buffer_list);
 
-	ret = 0;
+	file->f_buffer_end = length;
+	file->f_buffer_truncated = 1;
 
 	mutex_unlock(&file->f_buffer_mutex);
+	ret = 0;
 out:
 	return ret;
 out_free_wb:

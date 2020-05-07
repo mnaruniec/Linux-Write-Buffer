@@ -121,6 +121,8 @@ static struct file *__alloc_file(int flags, const struct cred *cred)
 	// TODO verify
 	mutex_init(&f->f_buffer_mutex);
 	INIT_LIST_HEAD(&f->f_buffer_list);
+	f->f_buffer_end = 0;
+	f->f_buffer_truncated = 0;
 
 	return f;
 }

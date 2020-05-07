@@ -144,6 +144,24 @@ int vfs_statx_fd(unsigned int fd, struct kstat *stat,
 	if (f.file) {
 		error = vfs_getattr(&f.file->f_path, stat,
 				    request_mask, query_flags);
+
+		if (
+			!error
+			&& (request_mask & STATX_SIZE)
+			&& (f.file->f_flags & O_BUFFERED_WRITE)
+		) {
+			if (mutex_lock_interruptible(&f.file->f_buffer_mutex)) {
+				error = -ERESTARTSYS;
+			} else {
+				if (
+					f.file->f_buffer_truncated
+					|| f.file->f_buffer_end > stat->size
+				)
+					stat->size = f.file->f_buffer_end;
+				mutex_unlock(&f.file->f_buffer_mutex);
+			}
+		}
+
 		fdput(f);
 	}
 	return error;

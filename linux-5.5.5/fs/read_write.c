@@ -603,6 +603,8 @@ static ssize_t buffer_write(struct file *file, const char __user *buf,
 
 	ret = count;
 	*pos = local_pos;
+	if (*pos > file->f_buffer_end)
+		file->f_buffer_end = *pos;
 out:
 	return ret;
 

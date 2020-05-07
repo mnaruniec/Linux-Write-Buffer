@@ -983,6 +983,8 @@ struct file {
 
 	struct mutex		f_buffer_mutex;  // TODO rw lock
 	struct list_head	f_buffer_list;
+	loff_t			f_buffer_end;  // address after all changes
+	unsigned short		f_buffer_truncated;
 } __randomize_layout
   __attribute__((aligned(4)));	/* lest something weird decides that 2 is OK */
 
