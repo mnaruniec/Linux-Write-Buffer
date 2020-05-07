@@ -40,6 +40,7 @@
 #include <linux/fs_types.h>
 #include <linux/build_bug.h>
 #include <linux/stddef.h>
+#include <linux/slab.h>
 
 #include <asm/byteorder.h>
 #include <uapi/linux/fs.h>
@@ -991,6 +992,26 @@ struct file_handle {
 	/* file identifier */
 	unsigned char f_handle[0];
 };
+
+
+
+// TODO might move
+static inline void init_write_buffer(struct write_buffer *wb)
+{
+	INIT_LIST_HEAD(&wb->buffer_list);
+	wb->buffer = NULL;
+	wb->size = 0;
+	wb->offset = 0;
+	wb->flags = 0;
+}
+
+// TODO might move
+static inline void delete_write_buffer(struct write_buffer *write_buffer)
+{
+	list_del(&write_buffer->buffer_list);
+	kfree(write_buffer->buffer);
+	kfree(write_buffer);
+}
 
 static inline struct file *get_file(struct file *f)
 {
@@ -1950,7 +1971,7 @@ extern loff_t vfs_dedupe_file_range_one(struct file *src_file, loff_t src_pos,
 					struct file *dst_file, loff_t dst_pos,
 					loff_t len, unsigned int remap_flags);
 
-extern ssize_t kernel_vfs_writev_single(struct file *file,
+extern ssize_t kernel_writev_single(struct file *file,
 					const struct kvec *vec,
 					loff_t *pos, rwf_t flags);
 

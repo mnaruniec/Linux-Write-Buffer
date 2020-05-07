@@ -199,27 +199,40 @@ int vfs_fsync_range(struct file *file, loff_t start, loff_t end, int datasync)
 }
 EXPORT_SYMBOL(vfs_fsync_range);
 
-static int flush_buffer(struct fd *fd, struct write_buffer *write_buffer)
+static ssize_t flush_buffer(struct fd *fd, struct write_buffer *write_buffer)
 {
-	int ret = 0;
+	ssize_t ret = 0;
+	size_t left = write_buffer->size;
+	loff_t pos = write_buffer->offset;
+	char *buf = write_buffer->buffer;
 
-	if (write_buffer->size <= 0) {
-		ret = do_sys_ftruncate_sync(
-			(unsigned int)-1, write_buffer->offset, 0, fd
-		);
-	} else {
-		// TODO
+	struct kvec kvec;
+
+	if (!left) {
+		ret = do_sys_ftruncate_sync((unsigned int)-1, pos, 0, fd);
+		goto out;
 	}
 
-	return ret;
-}
+	while (left) {
+		kvec.iov_base = buf;
+		kvec.iov_len = left;
 
-// TODO might move
-inline void delete_write_buffer(struct write_buffer *write_buffer)
-{
-	list_del(&write_buffer->buffer_list);
-	kfree(write_buffer->buffer);
-	kfree(write_buffer);
+		ret = kernel_writev_single(
+			fd->file, &kvec, &pos, write_buffer->flags
+		);
+
+		if (!ret) /* Should not happen, but let's avoid inf loop. */
+			ret = -EIO;
+		if (ret < 0)
+			goto out;
+
+		left -= ret;
+		buf += ret;
+	}
+
+	ret = write_buffer->size;
+out:
+	return ret;
 }
 
 static int fsync_flush_buffers(struct fd *fd)

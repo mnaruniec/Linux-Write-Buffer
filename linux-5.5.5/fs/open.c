@@ -152,16 +152,6 @@ COMPAT_SYSCALL_DEFINE2(truncate, const char __user *, path, compat_off_t, length
 }
 #endif
 
-// TODO move
-inline void init_write_buffer(struct write_buffer *wb)
-{
-	INIT_LIST_HEAD(&wb->buffer_list);
-	wb->buffer = NULL;
-	wb->size = 0;
-	wb->offset = 0;
-	wb->flags = 0;
-}
-
 static int append_ftruncate_buffer(struct file *file, loff_t length)
 {
 	int ret = -ENOMEM;

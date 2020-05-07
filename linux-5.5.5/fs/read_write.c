@@ -539,6 +539,84 @@ ssize_t kernel_write(struct file *file, const void *buf, size_t count,
 }
 EXPORT_SYMBOL(kernel_write);
 
+static ssize_t buffer_write(struct file *file, const char __user *buf,
+				size_t count, loff_t *pos)
+{
+	ssize_t ret = 0;
+
+	char *local_buf;
+	size_t local_count;
+	loff_t local_pos = *pos;
+
+	size_t left = count;
+	struct write_buffer *wb;
+
+	struct list_head *iter_pos;
+	struct list_head *iter_n;
+
+	struct list_head append_head;
+	INIT_LIST_HEAD(&append_head);
+
+	if (!count) {
+		goto out;
+	}
+
+	while (left) {
+		local_count = count > PAGE_SIZE ? PAGE_SIZE : count;
+
+		local_buf = kmalloc(local_count, GFP_KERNEL);
+		if (!local_buf) {
+			ret = -ENOMEM;
+			goto out_free_append_list;
+		}
+
+		if (copy_from_user(local_buf, buf, local_count)) {
+			ret = -EFAULT;
+			goto out_free_local_buffer;
+		}
+
+		wb = kmalloc(sizeof(struct write_buffer), GFP_KERNEL);
+		if (!wb) {
+			ret = -ENOMEM;
+			goto out_free_local_buffer;
+		}
+
+		init_write_buffer(wb);
+		wb->buffer = local_buf;
+		wb->size = local_count;
+		wb->offset =local_pos;
+
+		list_add_tail(&wb->buffer_list, &append_head);
+
+		left -= local_count;
+		local_pos += local_count;
+	}
+
+	if (mutex_lock_interruptible(&file->f_buffer_mutex)) {
+		ret = -ERESTARTSYS;
+		goto out_free_append_list;
+	}
+
+	list_splice_tail(&append_head, &file->f_buffer_list);
+
+	mutex_unlock(&file->f_buffer_mutex);
+
+	ret = count;
+	*pos = local_pos;
+out:
+	return ret;
+
+out_free_local_buffer:
+	kfree(local_buf);
+out_free_append_list:
+	list_for_each_safe(iter_pos, iter_n, &append_head) {
+		delete_write_buffer(
+			list_entry(iter_pos, struct write_buffer, buffer_list)
+		);
+	}
+	goto out;
+}
+
 ssize_t vfs_write(struct file *file, const char __user *buf, size_t count, loff_t *pos)
 {
 	ssize_t ret;
@@ -554,6 +632,13 @@ ssize_t vfs_write(struct file *file, const char __user *buf, size_t count, loff_
 	if (!ret) {
 		if (count > MAX_RW_COUNT)
 			count =  MAX_RW_COUNT;
+
+		if (file->f_flags & O_BUFFERED_WRITE) {
+			ret = buffer_write(file, buf, count, pos);
+			if (ret)
+				return ret;
+		}
+
 		file_start_write(file);
 		ret = __vfs_write(file, buf, count, pos);
 		if (ret > 0) {
@@ -1001,7 +1086,7 @@ ssize_t vfs_readv(struct file *file, const struct iovec __user *vec,
 	return ret;
 }
 
-ssize_t kernel_vfs_writev_single(struct file *file, const struct kvec *vec,
+ssize_t kernel_writev_single(struct file *file, const struct kvec *vec,
 		   loff_t *pos, rwf_t flags)
 {
 	struct iov_iter iter;
