@@ -545,28 +545,7 @@ ssize_t __vfs_read(struct file *file, char __user *buf, size_t count,
 		}
 
 		orig_pos = *pos;
-
-		if (mutex_lock_interruptible(&file->f_buffer_mutex)) {
-			ret = -ERESTARTSYS;
-			goto out;
-		}
-		// TODO remove?
-		// if (file->f_buffer_truncated) {
-		// 	if (file->f_buffer_end <= *pos) {
-		// 		ret = 0;
-		// 		goto out_unlock;
-		// 	}
-		//
-		// 	diff = file->f_buffer_end - *pos;
-		// 	count = count > diff ? diff : count;
-		// }
-
 		count = count > PAGE_SIZE ? PAGE_SIZE : count;
-
-		if (!count) {
-			ret = 0;
-			goto out_unlock;
-		}
 
 		old_fs = get_fs();
 		set_fs(KERNEL_DS);
@@ -587,10 +566,17 @@ ssize_t __vfs_read(struct file *file, char __user *buf, size_t count,
 		ret = -EINVAL;
 
 	if (file->f_flags & O_BUFFERED_WRITE && orig_count > 0) {
-		if (ret >= 0)
+		if (ret >= 0) {
+			if (mutex_lock_interruptible(&file->f_buffer_mutex)) {
+				ret = -ERESTARTSYS;
+				goto out_free_buf;
+			}
+
 			ret = read_apply_buffers(
 				file, kern_buf, count, ret, orig_pos, pos
 			);
+			mutex_unlock(&file->f_buffer_mutex);
+		}
 		if (ret > 0) {
 			set_fs(old_fs);
 			if (copy_to_user(orig_buf, kern_buf, ret))
@@ -601,12 +587,11 @@ ssize_t __vfs_read(struct file *file, char __user *buf, size_t count,
 
 out:
 	return ret;
+
 out_free_buf:
 	kfree(kern_buf);
 out_restore_fs:
 	set_fs(old_fs);
-out_unlock:
-	mutex_unlock(&file->f_buffer_mutex);
 	goto out;
 }
 
