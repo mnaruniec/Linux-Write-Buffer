@@ -288,7 +288,8 @@ out:
 }
 EXPORT_SYMBOL(default_llseek);
 
-loff_t buffered_llseek(struct file *file, loff_t offset, int whence) {
+loff_t buffered_llseek(struct file *file, loff_t offset, int whence)
+{
 	loff_t ret = file->f_op->llseek(file, offset, whence);
 
 	if (ret >= 0 && file->f_flags & O_BUFFERED_WRITE && whence == SEEK_END) {
@@ -442,10 +443,14 @@ static ssize_t new_sync_read(struct file *filp, char __user *buf, size_t len, lo
 	return ret;
 }
 
-// TODO enlenghting
 static ssize_t apply_truncate_buffer(struct write_buffer *entry, char *buf, size_t cap,
 				ssize_t got, loff_t orig_pos, loff_t *pos)
 {
+	if (!got && entry->offset > orig_pos) {
+		got = min((size_t)(entry->offset - orig_pos), cap);
+		*pos = orig_pos + got;
+		memset(buf, 0, got);
+	}
 	if (entry->offset < *pos) {
 		*pos = max(entry->offset, orig_pos);
 		got = *pos - orig_pos;
@@ -727,9 +732,6 @@ static ssize_t buffer_write(struct file *file, const char __user *buf,
 	size_t left = count;
 	struct write_buffer *wb;
 
-	struct list_head *iter_pos;
-	struct list_head *iter_n;
-
 	struct list_head append_head;
 	INIT_LIST_HEAD(&append_head);
 
@@ -787,11 +789,7 @@ out:
 out_free_local_buffer:
 	kfree(local_buf);
 out_free_append_list:
-	list_for_each_safe(iter_pos, iter_n, &append_head) {
-		delete_write_buffer(
-			list_entry(iter_pos, struct write_buffer, buffer_list)
-		);
-	}
+	delete_write_buffer_list(&append_head);
 	goto out;
 }
 

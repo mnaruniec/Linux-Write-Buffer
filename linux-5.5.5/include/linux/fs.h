@@ -1015,6 +1015,18 @@ static inline void delete_write_buffer(struct write_buffer *write_buffer)
 	kfree(write_buffer);
 }
 
+static inline void delete_write_buffer_list(struct list_head *head)
+{
+	struct list_head *iter_pos;
+	struct list_head *iter_n;
+
+	list_for_each_safe(iter_pos, iter_n, head) {
+		delete_write_buffer(
+			list_entry(iter_pos, struct write_buffer, buffer_list)
+		);
+	}
+}
+
 static inline struct file *get_file(struct file *f)
 {
 	atomic_long_inc(&f->f_count);
