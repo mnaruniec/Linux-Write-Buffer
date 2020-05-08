@@ -3,4 +3,5 @@
 CMakeLists.txt
 cmake-build-debug
 linux-5.5.5.tar.xz
+hshare
 

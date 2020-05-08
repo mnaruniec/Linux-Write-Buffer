@@ -418,15 +418,167 @@ static ssize_t new_sync_read(struct file *filp, char __user *buf, size_t len, lo
 	return ret;
 }
 
+// TODO enlenghting
+static ssize_t apply_truncate_buffer(struct write_buffer *entry, char *buf, size_t cap,
+				ssize_t got, loff_t orig_pos, loff_t *pos)
+{
+	if (entry->offset < *pos) {
+		*pos = max(entry->offset, orig_pos);
+		got = *pos - orig_pos;
+	}
+	return got;
+}
+
+// TODO refactor all to min/max
+static ssize_t apply_write_buffer(struct write_buffer *entry, char *buf, size_t cap,
+				ssize_t got, loff_t orig_pos, loff_t *pos)
+{
+	char *to;
+	char *from;
+	size_t tmp;
+
+	struct write_buffer s_entry = *entry;
+	loff_t s_entry_end = s_entry.offset + s_entry.size;
+
+	if (!got && s_entry_end > orig_pos) {
+		got = max(s_entry.offset - orig_pos, 0LL);
+		got = min((size_t)got, cap);
+		*pos = orig_pos + got;
+		memset(buf, 0, got);
+	}
+
+	if (s_entry_end >= orig_pos && *pos >= s_entry.offset) {  /* overlap */
+		/* remove data before orig_pos */
+		tmp = max(orig_pos - s_entry.offset, 0LL);
+		s_entry.buffer += tmp;
+		s_entry.offset += tmp;
+		s_entry.size -= tmp;
+
+
+		/* get relative offset */
+		tmp = max(s_entry.offset - orig_pos, 0LL);
+
+		/* remove data over cap */
+		s_entry.size = min(s_entry.size, cap - tmp);
+		s_entry_end = s_entry.offset + s_entry.size;
+
+		from = s_entry.buffer;
+		to = buf + tmp;
+
+		memcpy(to, from, s_entry.size);
+
+		got = max((size_t)got, tmp + s_entry.size);
+		*pos = orig_pos + got;
+	}
+
+	return got;
+}
+
+// TODO check for overflows
+static ssize_t read_apply_buffers(struct file *file, char *buf, size_t cap,
+				ssize_t got, loff_t orig_pos, loff_t *pos)
+{
+	struct list_head *iter_pos;
+	struct write_buffer *entry;
+
+	// quick checks
+
+	list_for_each(iter_pos, &file->f_buffer_list) {
+		entry = list_entry(iter_pos, struct write_buffer, buffer_list);
+
+		got = entry->size
+			? apply_write_buffer(
+				entry, buf, cap, got, orig_pos, pos)
+			: apply_truncate_buffer(
+				entry, buf, cap, got, orig_pos, pos);
+
+		if (got < 0)
+			break;
+	}
+
+	return got;
+}
+
 ssize_t __vfs_read(struct file *file, char __user *buf, size_t count,
 		   loff_t *pos)
 {
+	ssize_t ret;
+	mm_segment_t old_fs = KERNEL_DS;
+	size_t orig_count = count;
+	loff_t orig_pos = 0;
+	char __user *orig_buf = buf;
+	char *kern_buf = NULL;
+
+	if (file->f_flags & O_BUFFERED_WRITE && orig_count > 0) {
+		if (!pos) {
+			ret = -ESPIPE;
+			goto out;
+		}
+
+		orig_pos = *pos;
+
+		if (mutex_lock_interruptible(&file->f_buffer_mutex)) {
+			ret = -ERESTARTSYS;
+			goto out;
+		}
+		// TODO remove?
+		// if (file->f_buffer_truncated) {
+		// 	if (file->f_buffer_end <= *pos) {
+		// 		ret = 0;
+		// 		goto out_unlock;
+		// 	}
+		//
+		// 	diff = file->f_buffer_end - *pos;
+		// 	count = count > diff ? diff : count;
+		// }
+
+		count = count > PAGE_SIZE ? PAGE_SIZE : count;
+
+		if (!count) {
+			ret = 0;
+			goto out_unlock;
+		}
+
+		old_fs = get_fs();
+		set_fs(KERNEL_DS);
+
+		kern_buf = kmalloc(count, GFP_KERNEL);
+		if (!kern_buf) {
+			ret = -ENOMEM;
+			goto out_restore_fs;
+		}
+		buf = (char __user *)kern_buf;
+	}
+
 	if (file->f_op->read)
-		return file->f_op->read(file, buf, count, pos);
+		ret = file->f_op->read(file, buf, count, pos);
 	else if (file->f_op->read_iter)
-		return new_sync_read(file, buf, count, pos);
+		ret = new_sync_read(file, buf, count, pos);
 	else
-		return -EINVAL;
+		ret = -EINVAL;
+
+	if (file->f_flags & O_BUFFERED_WRITE && orig_count > 0) {
+		if (ret >= 0)
+			ret = read_apply_buffers(
+				file, kern_buf, count, ret, orig_pos, pos
+			);
+		if (ret > 0) {
+			set_fs(old_fs);
+			if (copy_to_user(orig_buf, kern_buf, ret))
+				ret = -EFAULT;
+		}
+		goto out_free_buf;
+	}
+
+out:
+	return ret;
+out_free_buf:
+	kfree(kern_buf);
+out_restore_fs:
+	set_fs(old_fs);
+out_unlock:
+	mutex_unlock(&file->f_buffer_mutex);
+	goto out;
 }
 
 ssize_t kernel_read(struct file *file, void *buf, size_t count, loff_t *pos)
