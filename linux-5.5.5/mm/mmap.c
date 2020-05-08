@@ -1568,6 +1568,12 @@ unsigned long ksys_mmap_pgoff(unsigned long addr, unsigned long len,
 		file = fget(fd);
 		if (!file)
 			return -EBADF;
+
+		if (file->f_flags & O_BUFFERED_WRITE) {
+			retval = -EPERM;
+			goto out_fput;
+		}
+
 		if (is_file_hugepages(file))
 			len = ALIGN(len, huge_page_size(hstate_file(file)));
 		retval = -EINVAL;

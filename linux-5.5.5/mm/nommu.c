@@ -1334,6 +1334,11 @@ unsigned long ksys_mmap_pgoff(unsigned long addr, unsigned long len,
 		file = fget(fd);
 		if (!file)
 			goto out;
+
+		if (file->f_flags & O_BUFFERED_WRITE) {
+			retval = -EPERM;
+			goto out;
+		}
 	}
 
 	flags &= ~(MAP_EXECUTABLE | MAP_DENYWRITE);
