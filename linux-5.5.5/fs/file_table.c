@@ -300,6 +300,8 @@ static void __fput(struct file *file)
 	if (unlikely(mode & FMODE_NEED_UNMOUNT))
 		dissolve_on_fput(mnt);
 	mntput(mnt);
+
+	delete_write_buffer_list(&file->f_buffer_list);
 out:
 	file_free(file);
 }

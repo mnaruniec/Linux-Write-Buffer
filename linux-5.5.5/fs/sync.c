@@ -259,6 +259,7 @@ static int fsync_flush_buffers(struct fd *fd)
 				if (ret < 0)
 					break;
 
+				// TODO might delete whole list
 				delete_write_buffer(entry);
 			}
 
