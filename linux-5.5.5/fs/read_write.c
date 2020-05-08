@@ -288,6 +288,30 @@ out:
 }
 EXPORT_SYMBOL(default_llseek);
 
+loff_t buffered_llseek(struct file *file, loff_t offset, int whence) {
+	loff_t ret = file->f_op->llseek(file, offset, whence);
+
+	if (ret >= 0 && file->f_flags & O_BUFFERED_WRITE && whence == SEEK_END) {
+		loff_t end = ret - offset;
+		if (end < 0)
+			return -EINVAL;
+		if (mutex_lock_interruptible(&file->f_buffer_mutex))
+			return -ERESTARTSYS;
+
+		if (file->f_buffer_truncated || file->f_buffer_end > end) {
+			ret = file->f_buffer_end + offset;
+			if (ret < 0) {
+				ret = -EINVAL;
+			} else {
+				file->f_pos = ret;
+			}
+		}
+		mutex_unlock(&file->f_buffer_mutex);
+	}
+
+	return ret;
+}
+
 loff_t vfs_llseek(struct file *file, loff_t offset, int whence)
 {
 	loff_t (*fn)(struct file *, loff_t, int);
@@ -295,7 +319,7 @@ loff_t vfs_llseek(struct file *file, loff_t offset, int whence)
 	fn = no_llseek;
 	if (file->f_mode & FMODE_LSEEK) {
 		if (file->f_op->llseek)
-			fn = file->f_op->llseek;
+			fn = buffered_llseek;
 	}
 	return fn(file, offset, whence);
 }
