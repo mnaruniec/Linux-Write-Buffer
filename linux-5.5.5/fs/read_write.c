@@ -545,7 +545,7 @@ ssize_t __vfs_read(struct file *file, char __user *buf, size_t count,
 		}
 
 		orig_pos = *pos;
-		count = count > PAGE_SIZE ? PAGE_SIZE : count;
+		count = min(count, PAGE_SIZE);
 
 		old_fs = get_fs();
 		set_fs(KERNEL_DS);
@@ -555,6 +555,8 @@ ssize_t __vfs_read(struct file *file, char __user *buf, size_t count,
 			ret = -ENOMEM;
 			goto out_restore_fs;
 		}
+		printk(KERN_ALERT "Alloced tmp_buf in __VFS_READ\n");
+
 		buf = (char __user *)kern_buf;
 	}
 
@@ -590,6 +592,7 @@ out:
 
 out_free_buf:
 	kfree(kern_buf);
+	printk(KERN_ALERT "Dealloced tmp_buf in __VFS_READ\n");
 out_restore_fs:
 	set_fs(old_fs);
 	goto out;
@@ -732,6 +735,7 @@ static ssize_t buffer_write(struct file *file, const char __user *buf,
 			ret = -ENOMEM;
 			goto out_free_append_list;
 		}
+		printk(KERN_ALERT "Alloced buffer in BUFFER_WRITE\n");
 
 		if (copy_from_user(local_buf, buf, local_count)) {
 			ret = -EFAULT;
@@ -743,6 +747,7 @@ static ssize_t buffer_write(struct file *file, const char __user *buf,
 			ret = -ENOMEM;
 			goto out_free_local_buffer;
 		}
+		printk(KERN_ALERT "Alloced wb in BUFFER_WRITE\n");
 
 		init_write_buffer(wb);
 		wb->buffer = local_buf;
@@ -773,6 +778,7 @@ out:
 
 out_free_local_buffer:
 	kfree(local_buf);
+	printk(KERN_ALERT "Dealloced buffer in BUFFER_WRITE\n");
 out_free_append_list:
 	delete_write_buffer_list(&append_head);
 	goto out;
@@ -1157,11 +1163,45 @@ out:
 }
 #endif
 
+static int copy_buffer_to_iter(struct iov_iter *iter, char *buf, ssize_t size)
+{
+	ssize_t to_copy;
+
+	while (size > 0) {
+		// TODO remove
+		if (iter->iov_offset != 0) {
+			printk(KERN_ALERT "MOJE: OFFSET %lu", iter->iov_offset);
+			return -1;
+		}
+
+		to_copy = min((size_t)size, iter->iov->iov_len);
+
+		if (copy_to_user(iter->iov->iov_base, buf, to_copy))
+			return -1;
+
+		iov_iter_advance(iter, to_copy);
+		size -= to_copy;
+		buf += to_copy;
+	}
+
+	return 0;
+}
+
+// TODO static check & testing
 static ssize_t do_iter_read(struct file *file, struct iov_iter *iter,
 		loff_t *pos, rwf_t flags)
 {
 	size_t tot_len;
 	ssize_t ret = 0;
+
+	mm_segment_t old_fs = KERNEL_DS;
+	loff_t orig_pos = 0;
+	ssize_t cap = 0;
+	char *kern_buf = NULL;
+	struct iov_iter *orig_iter = iter;
+
+	struct kvec kvec;
+	struct iov_iter kern_iter;
 
 	if (!(file->f_mode & FMODE_READ))
 		return -EBADF;
@@ -1175,14 +1215,72 @@ static ssize_t do_iter_read(struct file *file, struct iov_iter *iter,
 	if (ret < 0)
 		return ret;
 
+	if (file->f_flags & O_BUFFERED_WRITE) {
+		if (!pos) {
+			ret = -ESPIPE;
+			goto out;
+		}
+
+		orig_pos = *pos;
+		cap = min(tot_len, PAGE_SIZE);
+
+		old_fs = get_fs();
+		set_fs(KERNEL_DS);
+
+		kern_buf = kmalloc(cap, GFP_KERNEL);
+		if (!kern_buf) {
+			ret = -ENOMEM;
+			goto out_restore_fs;
+		}
+		printk(KERN_ALERT "Alloced tmp_buf in DO_ITER_READ\n");
+
+		kvec.iov_base = kern_buf;
+		kvec.iov_len = cap;
+
+		iov_iter_kvec(&kern_iter, READ, &kvec, 1, cap);
+		iter = &kern_iter;
+	}
+
 	if (file->f_op->read_iter)
 		ret = do_iter_readv_writev(file, iter, pos, READ, flags);
 	else
 		ret = do_loop_readv_writev(file, iter, pos, READ, flags);
+
+	if (file->f_flags & O_BUFFERED_WRITE) {
+		if (ret >= 0) {
+			if (mutex_lock_interruptible(&file->f_buffer_mutex)) {
+				ret = -ERESTARTSYS;
+				goto out_free_buf;
+			}
+
+			ret = read_apply_buffers(
+				file, kern_buf, cap, ret, orig_pos, pos
+			);
+			mutex_unlock(&file->f_buffer_mutex);
+		}
+		if (ret > 0) {
+			set_fs(old_fs);
+
+			if (copy_buffer_to_iter(orig_iter, kern_buf, ret)) {
+				ret = -EFAULT;
+			}
+
+		}
+		goto out_free_buf;
+	}
+
 out:
 	if (ret >= 0)
 		fsnotify_access(file);
 	return ret;
+
+out_free_buf:
+	kfree(kern_buf);
+	// TODO remove prints
+	printk(KERN_ALERT "Dealloced tmp_buf in DO_ITER_READ\n");
+out_restore_fs:
+	set_fs(old_fs);
+	goto out;
 }
 
 ssize_t vfs_iter_read(struct file *file, struct iov_iter *iter, loff_t *ppos,

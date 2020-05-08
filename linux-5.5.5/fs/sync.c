@@ -258,10 +258,10 @@ static int fsync_flush_buffers(struct fd *fd)
 				ret = flush_buffer(fd, entry);
 				if (ret < 0)
 					break;
-
-				// TODO might delete whole list
-				delete_write_buffer(entry);
 			}
+
+			printk(KERN_ALERT "FSYNC\n");
+			delete_write_buffer_list(&file->f_buffer_list);
 
 			file->f_buffer_end = 0;
 			file->f_buffer_truncated = 0;
