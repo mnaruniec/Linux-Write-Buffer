@@ -466,6 +466,7 @@ static ssize_t apply_write_buffer(struct write_buffer *entry, char *buf, size_t 
 	size_t tmp;
 
 	struct write_buffer s_entry = *entry;
+	/* Writes prevent overflow */
 	loff_t s_entry_end = s_entry.offset + s_entry.size;
 
 	if (!got && s_entry_end > orig_pos) {
@@ -502,14 +503,11 @@ static ssize_t apply_write_buffer(struct write_buffer *entry, char *buf, size_t 
 	return got;
 }
 
-// TODO check for overflows
 static ssize_t read_apply_buffers(struct file *file, char *buf, size_t cap,
 				ssize_t got, loff_t orig_pos, loff_t *pos)
 {
 	struct list_head *iter_pos;
 	struct write_buffer *entry;
-
-	// quick checks
 
 	list_for_each(iter_pos, &file->f_buffer_list) {
 		entry = list_entry(iter_pos, struct write_buffer, buffer_list);
@@ -554,7 +552,6 @@ ssize_t __vfs_read(struct file *file, char __user *buf, size_t count,
 			ret = -ENOMEM;
 			goto out_restore_fs;
 		}
-		printk(KERN_ALERT "Alloced tmp_buf in __VFS_READ\n");
 
 		buf = (char __user *)kern_buf;
 	}
@@ -591,7 +588,6 @@ out:
 
 out_free_buf:
 	kfree(kern_buf);
-	printk(KERN_ALERT "Dealloced tmp_buf in __VFS_READ\n");
 out_restore_fs:
 	set_fs(old_fs);
 	goto out;
@@ -718,7 +714,7 @@ static ssize_t buffer_interval(struct list_head *append_head,
 	loff_t local_pos = *pos;
 	struct write_buffer *wb;
 
-	while (left) {
+	while (left > 0) {
 		local_count = min(PAGE_SIZE, left);
 
 		local_buf = kmalloc(local_count, GFP_KERNEL);
@@ -726,7 +722,6 @@ static ssize_t buffer_interval(struct list_head *append_head,
 			ret = -ENOMEM;
 			goto out;
 		}
-		printk(KERN_ALERT "Alloced buffer in BUFFER_INTERVAL\n");
 
 		if (copy_from_user(local_buf, buf, local_count)) {
 			ret = -EFAULT;
@@ -738,7 +733,6 @@ static ssize_t buffer_interval(struct list_head *append_head,
 			ret = -ENOMEM;
 			goto out_free_local_buffer;
 		}
-		printk(KERN_ALERT "Alloced wb in BUFFER_INTERVAL\n");
 
 		init_write_buffer(wb);
 		wb->buffer = local_buf;
@@ -761,11 +755,14 @@ out:
 
 out_free_local_buffer:
 	kfree(local_buf);
-	printk(KERN_ALERT "Dealloced buffer in BUFFER_INTERVAL\n");
 	goto out;
 }
 
-// TODO check write len
+inline static ssize_t trim_count(loff_t pos, ssize_t count) {
+	long space = LONG_MAX - pos;
+	return min(count, space);
+}
+
 static ssize_t buffer_write(struct file *file, const char __user *buf,
 				size_t count, loff_t *pos)
 {
@@ -781,6 +778,8 @@ static ssize_t buffer_write(struct file *file, const char __user *buf,
 	if (!count) {
 		goto out;
 	}
+
+	count = trim_count(*pos, count);
 
 	ret = buffer_interval(&append_head, buf, count, &local_pos, 0);
 	if (ret < 0) {
@@ -1252,7 +1251,6 @@ static ssize_t do_iter_read(struct file *file, struct iov_iter *iter,
 			ret = -ENOMEM;
 			goto out_restore_fs;
 		}
-		printk(KERN_ALERT "Alloced tmp_buf in DO_ITER_READ\n");
 
 		kvec.iov_base = kern_buf;
 		kvec.iov_len = cap;
@@ -1296,8 +1294,6 @@ out:
 
 out_free_buf:
 	kfree(kern_buf);
-	// TODO remove prints
-	printk(KERN_ALERT "Dealloced tmp_buf in DO_ITER_READ\n");
 out_restore_fs:
 	set_fs(old_fs);
 	goto out;
@@ -1392,6 +1388,8 @@ static ssize_t buffer_writev(struct file *file, struct iov_iter *iter,
 	size_t tot_len;
 	ssize_t ret = 0;
 
+	ssize_t left;
+	ssize_t len;
 	loff_t local_pos;
 	struct list_head append_head;
 	INIT_LIST_HEAD(&append_head);
@@ -1407,22 +1405,30 @@ static ssize_t buffer_writev(struct file *file, struct iov_iter *iter,
 		return -EINVAL;
 
 	tot_len = iov_iter_count(iter);
+	tot_len = trim_count(*pos, tot_len);
+	iov_iter_truncate(iter, tot_len);
+	left = tot_len;
+
 	if (!tot_len)
 		return 0;
+
 	ret = rw_verify_area(WRITE, file, pos, tot_len);
 	if (ret < 0)
 		return ret;
 
-	while (iter->nr_segs) {
+	while (iter->nr_segs && left > 0) {
+		len = min(left, (ssize_t)iter->iov->iov_len);
+
 		ret = buffer_interval(
-			&append_head, iter->iov->iov_base, iter->iov->iov_len,
+			&append_head, iter->iov->iov_base, len,
 			&local_pos, flags
 		);
 		if (ret < 0) {
 			goto out_free_append_list;
 		}
 
-		iov_iter_advance(iter, iter->iov->iov_len);
+		iov_iter_advance(iter, len);
+		left -= len;
 	}
 
 	if (mutex_lock_interruptible(&file->f_buffer_mutex)) {

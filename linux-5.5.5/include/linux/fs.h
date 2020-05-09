@@ -1007,14 +1007,8 @@ static inline void init_write_buffer(struct write_buffer *wb)
 static inline void delete_write_buffer(struct write_buffer *write_buffer)
 {
 	list_del(&write_buffer->buffer_list);
-	if (write_buffer->buffer) {
-		printk(KERN_ALERT "Dealloced buffer in DELETE_WRITE_BUFFER\n");
-	} else{
-		printk(KERN_ALERT "NULL buffer in DELETE_WRITE_BUFFER\n");
-	}
 	kfree(write_buffer->buffer);
 	kfree(write_buffer);
-	printk(KERN_ALERT "Dealloced wb in DELETE_WRITE_BUFFER\n");
 }
 
 static inline void delete_write_buffer_list(struct list_head *head)

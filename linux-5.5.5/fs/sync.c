@@ -260,7 +260,6 @@ static int fsync_flush_buffers(struct fd *fd)
 					break;
 			}
 
-			printk(KERN_ALERT "FSYNC\n");
 			delete_write_buffer_list(&file->f_buffer_list);
 
 			file->f_buffer_end = 0;

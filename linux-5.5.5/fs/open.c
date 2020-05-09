@@ -160,8 +160,6 @@ static int append_ftruncate_buffer(struct file *file, loff_t length)
 
 	if (!wb)
 		goto out;
-	printk(KERN_ALERT "Alloced wb in APPEND_TRUNCATE_BUFFER\n");
-
 
 	init_write_buffer(wb);
 	wb->offset = length;
@@ -182,7 +180,6 @@ out:
 
 out_free_wb:
 	kfree(wb);
-	printk(KERN_ALERT "Dealloced wb in APPEND_TRUNCATE_BUFFER\n");
 	goto out;
 }
 
