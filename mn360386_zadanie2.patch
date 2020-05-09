@@ -1,0 +1,1140 @@
+diff -uprN ../linux-5.5.5/fs/fcntl.c linux-5.5.5/fs/fcntl.c
+--- ../linux-5.5.5/fs/fcntl.c	2020-02-19 19:54:14.000000000 +0100
++++ linux-5.5.5/fs/fcntl.c	2020-05-09 11:45:12.553446915 +0200
+@@ -37,6 +37,9 @@ static int setfl(int fd, struct file * f
+ 	struct inode * inode = file_inode(filp);
+ 	int error = 0;
+ 
++	if ((filp->f_flags & O_BUFFERED_WRITE) && (arg & O_APPEND))
++		return -EPERM;
++
+ 	/*
+ 	 * O_APPEND cannot be cleared if the file is marked as append-only
+ 	 * and the file is open for write.
+@@ -446,7 +449,7 @@ static int check_fcntl_cmd(unsigned cmd)
+ }
+ 
+ SYSCALL_DEFINE3(fcntl, unsigned int, fd, unsigned int, cmd, unsigned long, arg)
+-{	
++{
+ 	struct fd f = fdget_raw(fd);
+ 	long err = -EBADF;
+ 
+@@ -471,7 +474,7 @@ out:
+ #if BITS_PER_LONG == 32
+ SYSCALL_DEFINE3(fcntl64, unsigned int, fd, unsigned int, cmd,
+ 		unsigned long, arg)
+-{	
++{
+ 	void __user *argp = (void __user *)arg;
+ 	struct fd f = fdget_raw(fd);
+ 	struct flock64 flock;
+@@ -488,7 +491,7 @@ SYSCALL_DEFINE3(fcntl64, unsigned int, f
+ 	err = security_file_fcntl(f.file, cmd, arg);
+ 	if (err)
+ 		goto out1;
+-	
++
+ 	switch (cmd) {
+ 	case F_GETLK64:
+ 	case F_OFD_GETLK:
+@@ -738,8 +741,8 @@ static void send_sigio_to_task(struct ta
+ 		kernel_siginfo_t si;
+ 		default:
+ 			/* Queue a rt signal with the appropriate fd as its
+-			   value.  We use SI_SIGIO as the source, not 
+-			   SI_KERNEL, since kernel signals always get 
++			   value.  We use SI_SIGIO as the source, not
++			   SI_KERNEL, since kernel signals always get
+ 			   delivered even if we can't queue.  Failure to
+ 			   queue in this case _should_ be reported; we fall
+ 			   back to SIGIO in that case. --sct */
+@@ -780,7 +783,7 @@ void send_sigio(struct fown_struct *fown
+ 	struct task_struct *p;
+ 	enum pid_type type;
+ 	struct pid *pid;
+-	
++
+ 	read_lock(&fown->lock);
+ 
+ 	type = fown->pid_type;
+@@ -818,7 +821,7 @@ int send_sigurg(struct fown_struct *fown
+ 	enum pid_type type;
+ 	struct pid *pid;
+ 	int ret = 0;
+-	
++
+ 	read_lock(&fown->lock);
+ 
+ 	type = fown->pid_type;
+@@ -1031,7 +1034,7 @@ static int __init fcntl_init(void)
+ 	 * Exceptions: O_NONBLOCK is a two bit define on parisc; O_NDELAY
+ 	 * is defined as O_NONBLOCK on some platforms and not on others.
+ 	 */
+-	BUILD_BUG_ON(21 - 1 /* for O_RDONLY being 0 */ !=
++	BUILD_BUG_ON(22 - 1 /* for O_RDONLY being 0 */ !=
+ 		HWEIGHT32(
+ 			(VALID_OPEN_FLAGS & ~(O_NONBLOCK | O_NDELAY)) |
+ 			__FMODE_EXEC | __FMODE_NONOTIFY));
+diff -uprN ../linux-5.5.5/fs/file_table.c linux-5.5.5/fs/file_table.c
+--- ../linux-5.5.5/fs/file_table.c	2020-02-19 19:54:14.000000000 +0100
++++ linux-5.5.5/fs/file_table.c	2020-05-09 16:12:02.350447897 +0200
+@@ -118,6 +118,11 @@ static struct file *__alloc_file(int fla
+ 	f->f_mode = OPEN_FMODE(flags);
+ 	/* f->f_version: 0 */
+ 
++	mutex_init(&f->f_buffer_mutex);
++	INIT_LIST_HEAD(&f->f_buffer_list);
++	f->f_buffer_end = 0;
++	f->f_buffer_truncated = 0;
++
+ 	return f;
+ }
+ 
+@@ -294,6 +299,8 @@ static void __fput(struct file *file)
+ 	if (unlikely(mode & FMODE_NEED_UNMOUNT))
+ 		dissolve_on_fput(mnt);
+ 	mntput(mnt);
++
++	delete_write_buffer_list(&file->f_buffer_list);
+ out:
+ 	file_free(file);
+ }
+diff -uprN ../linux-5.5.5/fs/internal.h linux-5.5.5/fs/internal.h
+--- ../linux-5.5.5/fs/internal.h	2020-02-19 19:54:14.000000000 +0100
++++ linux-5.5.5/fs/internal.h	2020-05-09 11:45:12.553446915 +0200
+@@ -9,6 +9,7 @@ struct super_block;
+ struct file_system_type;
+ struct iomap;
+ struct iomap_ops;
++struct fd;
+ struct linux_binprm;
+ struct path;
+ struct mount;
+@@ -125,6 +126,8 @@ extern struct file *do_filp_open(int dfd
+ extern struct file *do_file_open_root(struct dentry *, struct vfsmount *,
+ 		const char *, const struct open_flags *);
+ 
++long do_sys_ftruncate_sync(unsigned int fd, loff_t length, int small,
++		struct fd *sync_fd);
+ long do_sys_ftruncate(unsigned int fd, loff_t length, int small);
+ long do_faccessat(int dfd, const char __user *filename, int mode);
+ int do_fchmodat(int dfd, const char __user *filename, umode_t mode);
+diff -uprN ../linux-5.5.5/fs/open.c linux-5.5.5/fs/open.c
+--- ../linux-5.5.5/fs/open.c	2020-02-19 19:54:14.000000000 +0100
++++ linux-5.5.5/fs/open.c	2020-05-09 17:37:07.757436137 +0200
+@@ -152,7 +152,42 @@ COMPAT_SYSCALL_DEFINE2(truncate, const c
+ }
+ #endif
+ 
+-long do_sys_ftruncate(unsigned int fd, loff_t length, int small)
++static int append_ftruncate_buffer(struct file *file, loff_t length)
++{
++	int ret = -ENOMEM;
++	struct write_buffer *wb =
++		kmalloc(sizeof(struct write_buffer), GFP_KERNEL);
++
++	if (!wb)
++		goto out;
++
++	init_write_buffer(wb);
++	wb->offset = length;
++
++	ret = -ERESTARTSYS;
++	if (mutex_lock_interruptible(&file->f_buffer_mutex))
++		goto out_free_wb;
++
++	list_add_tail(&wb->buffer_list, &file->f_buffer_list);
++
++	file->f_buffer_end = length;
++	file->f_buffer_truncated = 1;
++
++	mutex_unlock(&file->f_buffer_mutex);
++	ret = 0;
++out:
++	return ret;
++
++out_free_wb:
++	kfree(wb);
++	goto out;
++}
++
++/*
++ * sync_fd is NULL for normal ftruncate, non-NULL for fsync with buffers.
++ */
++long do_sys_ftruncate_sync(unsigned int fd, loff_t length, int small,
++				struct fd *sync_fd)
+ {
+ 	struct inode *inode;
+ 	struct dentry *dentry;
+@@ -163,7 +198,9 @@ long do_sys_ftruncate(unsigned int fd, l
+ 	if (length < 0)
+ 		goto out;
+ 	error = -EBADF;
+-	f = fdget(fd);
++
++	f = sync_fd ? *sync_fd : fdget(fd);
++
+ 	if (!f.file)
+ 		goto out;
+ 
+@@ -182,6 +219,11 @@ long do_sys_ftruncate(unsigned int fd, l
+ 	if (small && length > MAX_NON_LFS)
+ 		goto out_putf;
+ 
++	if (!sync_fd && f.file->f_flags & O_BUFFERED_WRITE) {
++		error = append_ftruncate_buffer(f.file, length);
++		goto out_putf;
++	}
++
+ 	error = -EPERM;
+ 	/* Check IS_APPEND on real upper inode */
+ 	if (IS_APPEND(file_inode(f.file)))
+@@ -195,11 +237,17 @@ long do_sys_ftruncate(unsigned int fd, l
+ 		error = do_truncate(dentry, length, ATTR_MTIME|ATTR_CTIME, f.file);
+ 	sb_end_write(inode->i_sb);
+ out_putf:
+-	fdput(f);
++	if (!sync_fd)
++		fdput(f);
+ out:
+ 	return error;
+ }
+ 
++long do_sys_ftruncate(unsigned int fd, loff_t length, int small)
++{
++	return do_sys_ftruncate_sync(fd, length, small, NULL);
++}
++
+ SYSCALL_DEFINE2(ftruncate, unsigned int, fd, unsigned long, length)
+ {
+ 	return do_sys_ftruncate(fd, length, 1);
+@@ -997,6 +1045,12 @@ static inline int build_open_flags(int f
+ 		acc_mode = 0;
+ 	}
+ 
++	/*
++	 * Using these two flags together is unsupported.
++	 */
++	if ((flags & O_APPEND) && (flags & O_BUFFERED_WRITE))
++		return -EINVAL;
++
+ 	op->open_flag = flags;
+ 
+ 	/* O_TRUNC implies we need access checks for write permissions */
+@@ -1059,7 +1113,7 @@ struct file *filp_open(const char *filen
+ {
+ 	struct filename *name = getname_kernel(filename);
+ 	struct file *file = ERR_CAST(name);
+-	
++
+ 	if (!IS_ERR(name)) {
+ 		file = file_open_name(name, flags, mode);
+ 		putname(name);
+diff -uprN ../linux-5.5.5/fs/read_write.c linux-5.5.5/fs/read_write.c
+--- ../linux-5.5.5/fs/read_write.c	2020-02-19 19:54:14.000000000 +0100
++++ linux-5.5.5/fs/read_write.c	2020-05-09 17:37:30.157419696 +0200
+@@ -288,6 +288,31 @@ out:
+ }
+ EXPORT_SYMBOL(default_llseek);
+ 
++loff_t buffered_llseek(struct file *file, loff_t offset, int whence)
++{
++	loff_t ret = file->f_op->llseek(file, offset, whence);
++
++	if (ret >= 0 && file->f_flags & O_BUFFERED_WRITE && whence == SEEK_END) {
++		loff_t end = ret - offset;
++		if (end < 0)
++			return -EINVAL;
++		if (mutex_lock_interruptible(&file->f_buffer_mutex))
++			return -ERESTARTSYS;
++
++		if (file->f_buffer_truncated || file->f_buffer_end > end) {
++			ret = file->f_buffer_end + offset;
++			if (ret < 0) {
++				ret = -EINVAL;
++			} else {
++				file->f_pos = ret;
++			}
++		}
++		mutex_unlock(&file->f_buffer_mutex);
++	}
++
++	return ret;
++}
++
+ loff_t vfs_llseek(struct file *file, loff_t offset, int whence)
+ {
+ 	loff_t (*fn)(struct file *, loff_t, int);
+@@ -295,7 +320,7 @@ loff_t vfs_llseek(struct file *file, lof
+ 	fn = no_llseek;
+ 	if (file->f_mode & FMODE_LSEEK) {
+ 		if (file->f_op->llseek)
+-			fn = file->f_op->llseek;
++			fn = buffered_llseek;
+ 	}
+ 	return fn(file, offset, whence);
+ }
+@@ -418,15 +443,154 @@ static ssize_t new_sync_read(struct file
+ 	return ret;
+ }
+ 
++static ssize_t apply_truncate_buffer(struct write_buffer *entry, char *buf, size_t cap,
++				ssize_t got, loff_t orig_pos, loff_t *pos)
++{
++	if (!got && entry->offset > orig_pos) {
++		got = min((size_t)(entry->offset - orig_pos), cap);
++		*pos = orig_pos + got;
++		memset(buf, 0, got);
++	}
++	if (entry->offset < *pos) {
++		*pos = max(entry->offset, orig_pos);
++		got = *pos - orig_pos;
++	}
++	return got;
++}
++
++static ssize_t apply_write_buffer(struct write_buffer *entry, char *buf, size_t cap,
++				ssize_t got, loff_t orig_pos, loff_t *pos)
++{
++	char *to;
++	char *from;
++	size_t tmp;
++
++	struct write_buffer s_entry = *entry;
++	/* Writes prevent overflow */
++	loff_t s_entry_end = s_entry.offset + s_entry.size;
++
++	if (!got && s_entry_end > orig_pos) {
++		got = max(s_entry.offset - orig_pos, 0LL);
++		got = min((size_t)got, cap);
++		*pos = orig_pos + got;
++		memset(buf, 0, got);
++	}
++
++	if (s_entry_end >= orig_pos && *pos >= s_entry.offset) {  /* overlap */
++		/* remove data before orig_pos */
++		tmp = max(orig_pos - s_entry.offset, 0LL);
++		s_entry.buffer += tmp;
++		s_entry.offset += tmp;
++		s_entry.size -= tmp;
++
++
++		/* get relative offset */
++		tmp = max(s_entry.offset - orig_pos, 0LL);
++
++		/* remove data over cap */
++		s_entry.size = min(s_entry.size, cap - tmp);
++		s_entry_end = s_entry.offset + s_entry.size;
++
++		from = s_entry.buffer;
++		to = buf + tmp;
++
++		memcpy(to, from, s_entry.size);
++
++		got = max((size_t)got, tmp + s_entry.size);
++		*pos = orig_pos + got;
++	}
++
++	return got;
++}
++
++static ssize_t read_apply_buffers(struct file *file, char *buf, size_t cap,
++				ssize_t got, loff_t orig_pos, loff_t *pos)
++{
++	struct list_head *iter_pos;
++	struct write_buffer *entry;
++
++	list_for_each(iter_pos, &file->f_buffer_list) {
++		entry = list_entry(iter_pos, struct write_buffer, buffer_list);
++
++		got = entry->size
++			? apply_write_buffer(
++				entry, buf, cap, got, orig_pos, pos)
++			: apply_truncate_buffer(
++				entry, buf, cap, got, orig_pos, pos);
++
++		if (got < 0)
++			break;
++	}
++
++	return got;
++}
++
+ ssize_t __vfs_read(struct file *file, char __user *buf, size_t count,
+ 		   loff_t *pos)
+ {
++	ssize_t ret;
++	mm_segment_t old_fs = KERNEL_DS;
++	size_t orig_count = count;
++	loff_t orig_pos = 0;
++	char __user *orig_buf = buf;
++	char *kern_buf = NULL;
++
++	if (file->f_flags & O_BUFFERED_WRITE && orig_count > 0) {
++		if (!pos) {
++			ret = -ESPIPE;
++			goto out;
++		}
++
++		orig_pos = *pos;
++		count = min(count, PAGE_SIZE);
++
++		old_fs = get_fs();
++		set_fs(KERNEL_DS);
++
++		kern_buf = kmalloc(count, GFP_KERNEL);
++		if (!kern_buf) {
++			ret = -ENOMEM;
++			goto out_restore_fs;
++		}
++
++		buf = (char __user *)kern_buf;
++	}
++
+ 	if (file->f_op->read)
+-		return file->f_op->read(file, buf, count, pos);
++		ret = file->f_op->read(file, buf, count, pos);
+ 	else if (file->f_op->read_iter)
+-		return new_sync_read(file, buf, count, pos);
++		ret = new_sync_read(file, buf, count, pos);
+ 	else
+-		return -EINVAL;
++		ret = -EINVAL;
++
++	if (file->f_flags & O_BUFFERED_WRITE && orig_count > 0) {
++		if (ret >= 0) {
++			if (mutex_lock_interruptible(&file->f_buffer_mutex)) {
++				ret = -ERESTARTSYS;
++				goto out_free_buf;
++			}
++
++			ret = read_apply_buffers(
++				file, kern_buf, count, ret, orig_pos, pos
++			);
++			mutex_unlock(&file->f_buffer_mutex);
++		}
++		if (ret > 0) {
++			set_fs(old_fs);
++			if (copy_to_user(orig_buf, kern_buf, ret))
++				ret = -EFAULT;
++		}
++		goto out_free_buf;
++	}
++
++out:
++	return ret;
++
++out_free_buf:
++	kfree(kern_buf);
++out_restore_fs:
++	set_fs(old_fs);
++	goto out;
+ }
+ 
+ ssize_t kernel_read(struct file *file, void *buf, size_t count, loff_t *pos)
+@@ -539,6 +703,111 @@ ssize_t kernel_write(struct file *file,
+ }
+ EXPORT_SYMBOL(kernel_write);
+ 
++static ssize_t buffer_interval(struct list_head *append_head,
++			const char __user *buf, size_t count, loff_t *pos,
++			rwf_t flags)
++{
++	ssize_t ret = 0;
++	size_t left = count;
++	size_t local_count;
++	char *local_buf;
++	loff_t local_pos = *pos;
++	struct write_buffer *wb;
++
++	while (left > 0) {
++		local_count = min(PAGE_SIZE, left);
++
++		local_buf = kmalloc(local_count, GFP_KERNEL);
++		if (!local_buf) {
++			ret = -ENOMEM;
++			goto out;
++		}
++
++		if (copy_from_user(local_buf, buf, local_count)) {
++			ret = -EFAULT;
++			goto out_free_local_buffer;
++		}
++
++		wb = kmalloc(sizeof(struct write_buffer), GFP_KERNEL);
++		if (!wb) {
++			ret = -ENOMEM;
++			goto out_free_local_buffer;
++		}
++
++		init_write_buffer(wb);
++		wb->buffer = local_buf;
++		wb->size = local_count;
++		wb->offset = local_pos;
++		wb->flags = flags;
++
++		list_add_tail(&wb->buffer_list, append_head);
++
++		left -= local_count;
++		local_pos += local_count;
++		buf += local_count;
++	}
++
++	ret = (ssize_t)count;
++	*pos = local_pos;
++
++out:
++	return ret;
++
++out_free_local_buffer:
++	kfree(local_buf);
++	goto out;
++}
++
++inline static ssize_t trim_count(loff_t pos, ssize_t count) {
++	long space = LONG_MAX - pos;
++	return min(count, space);
++}
++
++static ssize_t buffer_write(struct file *file, const char __user *buf,
++				size_t count, loff_t *pos)
++{
++	ssize_t ret = 0;
++
++	loff_t local_pos = *pos;
++	struct list_head append_head;
++	INIT_LIST_HEAD(&append_head);
++
++	if (!pos)
++		return -ESPIPE;
++
++	if (!count) {
++		goto out;
++	}
++
++	count = trim_count(*pos, count);
++
++	ret = buffer_interval(&append_head, buf, count, &local_pos, 0);
++	if (ret < 0) {
++		goto out_free_append_list;
++	}
++
++	if (mutex_lock_interruptible(&file->f_buffer_mutex)) {
++		ret = -ERESTARTSYS;
++		goto out_free_append_list;
++	}
++
++	list_splice_tail(&append_head, &file->f_buffer_list);
++
++	if (local_pos > file->f_buffer_end)
++		file->f_buffer_end = local_pos;
++
++	mutex_unlock(&file->f_buffer_mutex);
++
++	ret = count;
++	*pos = local_pos;
++out:
++	return ret;
++
++out_free_append_list:
++	delete_write_buffer_list(&append_head);
++	goto out;
++}
++
+ ssize_t vfs_write(struct file *file, const char __user *buf, size_t count, loff_t *pos)
+ {
+ 	ssize_t ret;
+@@ -554,6 +823,13 @@ ssize_t vfs_write(struct file *file, con
+ 	if (!ret) {
+ 		if (count > MAX_RW_COUNT)
+ 			count =  MAX_RW_COUNT;
++
++		if (file->f_flags & O_BUFFERED_WRITE) {
++			ret = buffer_write(file, buf, count, pos);
++			if (ret)
++				return ret;
++		}
++
+ 		file_start_write(file);
+ 		ret = __vfs_write(file, buf, count, pos);
+ 		if (ret > 0) {
+@@ -661,7 +937,7 @@ ssize_t ksys_pwrite64(unsigned int fd, c
+ 	f = fdget(fd);
+ 	if (f.file) {
+ 		ret = -ESPIPE;
+-		if (f.file->f_mode & FMODE_PWRITE)  
++		if (f.file->f_mode & FMODE_PWRITE)
+ 			ret = vfs_write(f.file, buf, count, &pos);
+ 		fdput(f);
+ 	}
+@@ -911,12 +1187,41 @@ out:
+ }
+ #endif
+ 
++static int copy_buffer_to_iter(struct iov_iter *iter, char *buf, ssize_t size)
++{
++	ssize_t bytes;
++	char __user *to;
++
++	while (size > 0) {
++		bytes = min((size_t)size, iter->iov->iov_len - iter->iov_offset);
++		to = iter->iov->iov_base + iter->iov_offset;
++
++		if (copy_to_user(to, buf, bytes))
++			return -1;
++
++		iov_iter_advance(iter, bytes);
++		size -= bytes;
++		buf += bytes;
++	}
++
++	return 0;
++}
++
+ static ssize_t do_iter_read(struct file *file, struct iov_iter *iter,
+ 		loff_t *pos, rwf_t flags)
+ {
+ 	size_t tot_len;
+ 	ssize_t ret = 0;
+ 
++	mm_segment_t old_fs = KERNEL_DS;
++	loff_t orig_pos = 0;
++	ssize_t cap = 0;
++	char *kern_buf = NULL;
++	struct iov_iter *orig_iter = iter;
++
++	struct kvec kvec;
++	struct iov_iter kern_iter;
++
+ 	if (!(file->f_mode & FMODE_READ))
+ 		return -EBADF;
+ 	if (!(file->f_mode & FMODE_CAN_READ))
+@@ -929,14 +1234,69 @@ static ssize_t do_iter_read(struct file
+ 	if (ret < 0)
+ 		return ret;
+ 
++	if (file->f_flags & O_BUFFERED_WRITE) {
++		if (!pos) {
++			ret = -ESPIPE;
++			goto out;
++		}
++
++		orig_pos = *pos;
++		cap = min(tot_len, PAGE_SIZE);
++
++		old_fs = get_fs();
++		set_fs(KERNEL_DS);
++
++		kern_buf = kmalloc(cap, GFP_KERNEL);
++		if (!kern_buf) {
++			ret = -ENOMEM;
++			goto out_restore_fs;
++		}
++
++		kvec.iov_base = kern_buf;
++		kvec.iov_len = cap;
++
++		iov_iter_kvec(&kern_iter, READ, &kvec, 1, cap);
++		iter = &kern_iter;
++	}
++
+ 	if (file->f_op->read_iter)
+ 		ret = do_iter_readv_writev(file, iter, pos, READ, flags);
+ 	else
+ 		ret = do_loop_readv_writev(file, iter, pos, READ, flags);
++
++	if (file->f_flags & O_BUFFERED_WRITE) {
++		if (ret >= 0) {
++			if (mutex_lock_interruptible(&file->f_buffer_mutex)) {
++				ret = -ERESTARTSYS;
++				goto out_free_buf;
++			}
++
++			ret = read_apply_buffers(
++				file, kern_buf, cap, ret, orig_pos, pos
++			);
++			mutex_unlock(&file->f_buffer_mutex);
++		}
++		if (ret > 0) {
++			set_fs(old_fs);
++
++			if (copy_buffer_to_iter(orig_iter, kern_buf, ret)) {
++				ret = -EFAULT;
++			}
++
++		}
++		goto out_free_buf;
++	}
++
+ out:
+ 	if (ret >= 0)
+ 		fsnotify_access(file);
+ 	return ret;
++
++out_free_buf:
++	kfree(kern_buf);
++out_restore_fs:
++	set_fs(old_fs);
++	goto out;
+ }
+ 
+ ssize_t vfs_iter_read(struct file *file, struct iov_iter *iter, loff_t *ppos,
+@@ -1001,6 +1361,98 @@ ssize_t vfs_readv(struct file *file, con
+ 	return ret;
+ }
+ 
++ssize_t kernel_writev_single(struct file *file, const struct kvec *vec,
++		   loff_t *pos, rwf_t flags)
++{
++	struct iov_iter iter;
++	mm_segment_t old_fs;
++	ssize_t ret;
++
++	old_fs = get_fs();
++	set_fs(KERNEL_DS);
++
++	iov_iter_kvec(&iter, WRITE, vec, 1, vec->iov_len);
++
++	file_start_write(file);
++	ret = do_iter_write(file, &iter, pos, flags);
++	file_end_write(file);
++
++	set_fs(old_fs);
++
++	return ret;
++}
++
++static ssize_t buffer_writev(struct file *file, struct iov_iter *iter,
++				loff_t *pos, rwf_t flags)
++{
++	size_t tot_len;
++	ssize_t ret = 0;
++
++	ssize_t left;
++	ssize_t len;
++	loff_t local_pos;
++	struct list_head append_head;
++	INIT_LIST_HEAD(&append_head);
++
++	if (!pos)
++		return -ESPIPE;
++
++	local_pos = *pos;
++
++	if (!(file->f_mode & FMODE_WRITE))
++		return -EBADF;
++	if (!(file->f_mode & FMODE_CAN_WRITE))
++		return -EINVAL;
++
++	tot_len = iov_iter_count(iter);
++	tot_len = trim_count(*pos, tot_len);
++	iov_iter_truncate(iter, tot_len);
++	left = tot_len;
++
++	if (!tot_len)
++		return 0;
++
++	ret = rw_verify_area(WRITE, file, pos, tot_len);
++	if (ret < 0)
++		return ret;
++
++	while (iter->nr_segs && left > 0) {
++		len = min(left, (ssize_t)iter->iov->iov_len);
++
++		ret = buffer_interval(
++			&append_head, iter->iov->iov_base, len,
++			&local_pos, flags
++		);
++		if (ret < 0) {
++			goto out_free_append_list;
++		}
++
++		iov_iter_advance(iter, len);
++		left -= len;
++	}
++
++	if (mutex_lock_interruptible(&file->f_buffer_mutex)) {
++		ret = -ERESTARTSYS;
++		goto out_free_append_list;
++	}
++
++	list_splice_tail(&append_head, &file->f_buffer_list);
++
++	if (local_pos > file->f_buffer_end)
++		file->f_buffer_end = local_pos;
++
++	mutex_unlock(&file->f_buffer_mutex);
++
++	ret = tot_len;
++	*pos = local_pos;
++out:
++	return ret;
++
++out_free_append_list:
++	delete_write_buffer_list(&append_head);
++	goto out;
++}
++
+ static ssize_t vfs_writev(struct file *file, const struct iovec __user *vec,
+ 		   unsigned long vlen, loff_t *pos, rwf_t flags)
+ {
+@@ -1011,6 +1463,10 @@ static ssize_t vfs_writev(struct file *f
+ 
+ 	ret = import_iovec(WRITE, vec, vlen, ARRAY_SIZE(iovstack), &iov, &iter);
+ 	if (ret >= 0) {
++		if (file->f_flags & O_BUFFERED_WRITE) {
++			return buffer_writev(file, &iter, pos, flags);
++		}
++
+ 		file_start_write(file);
+ 		ret = do_iter_write(file, &iter, pos, flags);
+ 		file_end_write(file);
+diff -uprN ../linux-5.5.5/fs/stat.c linux-5.5.5/fs/stat.c
+--- ../linux-5.5.5/fs/stat.c	2020-02-19 19:54:14.000000000 +0100
++++ linux-5.5.5/fs/stat.c	2020-05-09 11:45:12.553446915 +0200
+@@ -144,6 +144,24 @@ int vfs_statx_fd(unsigned int fd, struct
+ 	if (f.file) {
+ 		error = vfs_getattr(&f.file->f_path, stat,
+ 				    request_mask, query_flags);
++
++		if (
++			!error
++			&& (request_mask & STATX_SIZE)
++			&& (f.file->f_flags & O_BUFFERED_WRITE)
++		) {
++			if (mutex_lock_interruptible(&f.file->f_buffer_mutex)) {
++				error = -ERESTARTSYS;
++			} else {
++				if (
++					f.file->f_buffer_truncated
++					|| f.file->f_buffer_end > stat->size
++				)
++					stat->size = f.file->f_buffer_end;
++				mutex_unlock(&f.file->f_buffer_mutex);
++			}
++		}
++
+ 		fdput(f);
+ 	}
+ 	return error;
+diff -uprN ../linux-5.5.5/fs/sync.c linux-5.5.5/fs/sync.c
+--- ../linux-5.5.5/fs/sync.c	2020-02-19 19:54:14.000000000 +0100
++++ linux-5.5.5/fs/sync.c	2020-05-09 17:38:02.464062494 +0200
+@@ -6,6 +6,7 @@
+ #include <linux/kernel.h>
+ #include <linux/file.h>
+ #include <linux/fs.h>
++#include <linux/list.h>
+ #include <linux/slab.h>
+ #include <linux/export.h>
+ #include <linux/namei.h>
+@@ -198,6 +199,79 @@ int vfs_fsync_range(struct file *file, l
+ }
+ EXPORT_SYMBOL(vfs_fsync_range);
+ 
++static ssize_t flush_buffer(struct fd *fd, struct write_buffer *write_buffer)
++{
++	ssize_t ret = 0;
++	size_t left = write_buffer->size;
++	loff_t pos = write_buffer->offset;
++	char *buf = write_buffer->buffer;
++
++	struct kvec kvec;
++
++	if (!left) {
++		ret = do_sys_ftruncate_sync((unsigned int)-1, pos, 0, fd);
++		goto out;
++	}
++
++	while (left) {
++		kvec.iov_base = buf;
++		kvec.iov_len = left;
++
++		ret = kernel_writev_single(
++			fd->file, &kvec, &pos, write_buffer->flags
++		);
++
++		if (!ret) /* Should not happen, but let's avoid inf loop. */
++			ret = -EIO;
++		if (ret < 0)
++			goto out;
++
++		left -= ret;
++		buf += ret;
++	}
++
++	ret = write_buffer->size;
++out:
++	return ret;
++}
++
++static int fsync_flush_buffers(struct fd *fd)
++{
++	int ret = 0;
++
++	struct write_buffer *entry;
++	struct list_head *pos;
++	struct list_head *n;
++
++	struct file *file = fd->file;
++
++	if (file->f_flags & O_BUFFERED_WRITE) {
++		ret = -ERESTARTSYS;
++		if (!mutex_lock_interruptible(&file->f_buffer_mutex)) {
++			ret = 0;
++
++			list_for_each_safe(pos, n, &file->f_buffer_list) {
++				entry = list_entry(
++					pos, struct write_buffer, buffer_list
++				);
++
++				ret = flush_buffer(fd, entry);
++				if (ret < 0)
++					break;
++			}
++
++			delete_write_buffer_list(&file->f_buffer_list);
++
++			file->f_buffer_end = 0;
++			file->f_buffer_truncated = 0;
++
++			mutex_unlock(&file->f_buffer_mutex);
++		}
++	}
++
++	return ret;
++}
++
+ /**
+  * vfs_fsync - perform a fsync or fdatasync on a file
+  * @file:		file to sync
+@@ -218,7 +292,9 @@ static int do_fsync(unsigned int fd, int
+ 	int ret = -EBADF;
+ 
+ 	if (f.file) {
+-		ret = vfs_fsync(f.file, datasync);
++		ret = datasync ? 0 : fsync_flush_buffers(&f);
++		if (ret >= 0)
++			ret = vfs_fsync(f.file, datasync);
+ 		fdput(f);
+ 	}
+ 	return ret;
+diff -uprN ../linux-5.5.5/include/linux/fcntl.h linux-5.5.5/include/linux/fcntl.h
+--- ../linux-5.5.5/include/linux/fcntl.h	2020-02-19 19:54:14.000000000 +0100
++++ linux-5.5.5/include/linux/fcntl.h	2020-05-09 11:45:12.553446915 +0200
+@@ -9,7 +9,7 @@
+ 	(O_RDONLY | O_WRONLY | O_RDWR | O_CREAT | O_EXCL | O_NOCTTY | O_TRUNC | \
+ 	 O_APPEND | O_NDELAY | O_NONBLOCK | O_NDELAY | __O_SYNC | O_DSYNC | \
+ 	 FASYNC	| O_DIRECT | O_LARGEFILE | O_DIRECTORY | O_NOFOLLOW | \
+-	 O_NOATIME | O_CLOEXEC | O_PATH | __O_TMPFILE)
++	 O_NOATIME | O_CLOEXEC | O_PATH | __O_TMPFILE | O_BUFFERED_WRITE)
+ 
+ #ifndef force_o_largefile
+ #define force_o_largefile() (!IS_ENABLED(CONFIG_ARCH_32BIT_OFF_T))
+diff -uprN ../linux-5.5.5/include/linux/fs.h linux-5.5.5/include/linux/fs.h
+--- ../linux-5.5.5/include/linux/fs.h	2020-02-19 19:54:14.000000000 +0100
++++ linux-5.5.5/include/linux/fs.h	2020-05-09 17:39:42.700654035 +0200
+@@ -40,6 +40,7 @@
+ #include <linux/fs_types.h>
+ #include <linux/build_bug.h>
+ #include <linux/stddef.h>
++#include <linux/slab.h>
+ 
+ #include <asm/byteorder.h>
+ #include <uapi/linux/fs.h>
+@@ -52,6 +53,7 @@ struct hd_geometry;
+ struct iovec;
+ struct kiocb;
+ struct kobject;
++struct kvec;
+ struct pipe_inode_info;
+ struct poll_table_struct;
+ struct kstatfs;
+@@ -250,7 +252,7 @@ struct iattr {
+  */
+ #define FILESYSTEM_MAX_STACK_DEPTH 2
+ 
+-/** 
++/**
+  * enum positive_aop_returns - aop return codes with specific semantics
+  *
+  * @AOP_WRITEPAGE_ACTIVATE: Informs the caller that page writeback has
+@@ -260,7 +262,7 @@ struct iattr {
+  * 			    be a candidate for writeback again in the near
+  * 			    future.  Other callers must be careful to unlock
+  * 			    the page if they get this return.  Returned by
+- * 			    writepage(); 
++ * 			    writepage();
+  *
+  * @AOP_TRUNCATED_PAGE: The AOP method that was handed a locked page has
+  *  			unlocked it and the page might have been truncated.
+@@ -932,6 +934,14 @@ static inline int ra_has_index(struct fi
+ 		index <  ra->start + ra->size);
+ }
+ 
++struct write_buffer {
++	struct list_head buffer_list;
++	char *buffer;
++	size_t size;	/* If 0 then truncate to offset*/
++	loff_t offset;
++	rwf_t flags;
++};
++
+ struct file {
+ 	union {
+ 		struct llist_node	fu_llist;
+@@ -970,6 +980,11 @@ struct file {
+ #endif /* #ifdef CONFIG_EPOLL */
+ 	struct address_space	*f_mapping;
+ 	errseq_t		f_wb_err;
++
++	struct mutex		f_buffer_mutex;
++	struct list_head	f_buffer_list;
++	loff_t			f_buffer_end;  // address after all changes
++	unsigned short		f_buffer_truncated;
+ } __randomize_layout
+   __attribute__((aligned(4)));	/* lest something weird decides that 2 is OK */
+ 
+@@ -980,6 +995,34 @@ struct file_handle {
+ 	unsigned char f_handle[0];
+ };
+ 
++static inline void init_write_buffer(struct write_buffer *wb)
++{
++	INIT_LIST_HEAD(&wb->buffer_list);
++	wb->buffer = NULL;
++	wb->size = 0;
++	wb->offset = 0;
++	wb->flags = 0;
++}
++
++static inline void delete_write_buffer(struct write_buffer *write_buffer)
++{
++	list_del(&write_buffer->buffer_list);
++	kfree(write_buffer->buffer);
++	kfree(write_buffer);
++}
++
++static inline void delete_write_buffer_list(struct list_head *head)
++{
++	struct list_head *iter_pos;
++	struct list_head *iter_n;
++
++	list_for_each_safe(iter_pos, iter_n, head) {
++		delete_write_buffer(
++			list_entry(iter_pos, struct write_buffer, buffer_list)
++		);
++	}
++}
++
+ static inline struct file *get_file(struct file *f)
+ {
+ 	atomic_long_inc(&f->f_count);
+@@ -992,8 +1035,8 @@ static inline struct file *get_file(stru
+ 
+ #define	MAX_NON_LFS	((1UL<<31) - 1)
+ 
+-/* Page cache limit. The filesystems should put that into their s_maxbytes 
+-   limits, otherwise bad things can happen in VM. */ 
++/* Page cache limit. The filesystems should put that into their s_maxbytes
++   limits, otherwise bad things can happen in VM. */
+ #if BITS_PER_LONG==32
+ #define MAX_LFS_FILESIZE	((loff_t)ULONG_MAX << PAGE_SHIFT)
+ #elif BITS_PER_LONG==64
+@@ -1938,6 +1981,10 @@ extern loff_t vfs_dedupe_file_range_one(
+ 					struct file *dst_file, loff_t dst_pos,
+ 					loff_t len, unsigned int remap_flags);
+ 
++extern ssize_t kernel_writev_single(struct file *file,
++					const struct kvec *vec,
++					loff_t *pos, rwf_t flags);
++
+ 
+ struct super_operations {
+    	struct inode *(*alloc_inode)(struct super_block *sb);
+@@ -2217,7 +2264,7 @@ int sync_inode_metadata(struct inode *in
+ struct file_system_type {
+ 	const char *name;
+ 	int fs_flags;
+-#define FS_REQUIRES_DEV		1 
++#define FS_REQUIRES_DEV		1
+ #define FS_BINARY_MOUNTDATA	2
+ #define FS_HAS_SUBTYPE		4
+ #define FS_USERNS_MOUNT		8	/* Can be mounted by userns root */
+@@ -3000,7 +3047,7 @@ extern ssize_t kernel_read(struct file *
+ extern ssize_t kernel_write(struct file *, const void *, size_t, loff_t *);
+ extern ssize_t __kernel_write(struct file *, const void *, size_t, loff_t *);
+ extern struct file * open_exec(const char *);
+- 
++
+ /* fs/dcache.c -- generic fs support functions */
+ extern bool is_subdir(struct dentry *, struct dentry *);
+ extern bool path_is_under(const struct path *, const struct path *);
+diff -uprN ../linux-5.5.5/include/uapi/asm-generic/fcntl.h linux-5.5.5/include/uapi/asm-generic/fcntl.h
+--- ../linux-5.5.5/include/uapi/asm-generic/fcntl.h	2020-02-19 19:54:14.000000000 +0100
++++ linux-5.5.5/include/uapi/asm-generic/fcntl.h	2020-05-09 11:45:12.553446915 +0200
+@@ -63,6 +63,7 @@
+ #define O_CLOEXEC	02000000	/* set close_on_exec */
+ #endif
+ 
++
+ /*
+  * Before Linux 2.6.33 only O_DSYNC semantics were implemented, but using
+  * the O_SYNC flag.  We continue to use the existing numerical value
+@@ -91,12 +92,16 @@
+ 
+ /* a horrid kludge trying to make sure that this will fail on old kernels */
+ #define O_TMPFILE (__O_TMPFILE | O_DIRECTORY)
+-#define O_TMPFILE_MASK (__O_TMPFILE | O_DIRECTORY | O_CREAT)      
++#define O_TMPFILE_MASK (__O_TMPFILE | O_DIRECTORY | O_CREAT)
+ 
+ #ifndef O_NDELAY
+ #define O_NDELAY	O_NONBLOCK
+ #endif
+ 
++#ifndef O_BUFFERED_WRITE
++#define O_BUFFERED_WRITE 040000000
++#endif
++
+ #define F_DUPFD		0	/* dup */
+ #define F_GETFD		1	/* get close_on_exec */
+ #define F_SETFD		2	/* set/clear close_on_exec */
+diff -uprN ../linux-5.5.5/mm/mmap.c linux-5.5.5/mm/mmap.c
+--- ../linux-5.5.5/mm/mmap.c	2020-02-19 19:54:14.000000000 +0100
++++ linux-5.5.5/mm/mmap.c	2020-05-09 11:45:12.556780240 +0200
+@@ -1568,6 +1568,12 @@ unsigned long ksys_mmap_pgoff(unsigned l
+ 		file = fget(fd);
+ 		if (!file)
+ 			return -EBADF;
++
++		if (file->f_flags & O_BUFFERED_WRITE) {
++			retval = -EPERM;
++			goto out_fput;
++		}
++
+ 		if (is_file_hugepages(file))
+ 			len = ALIGN(len, huge_page_size(hstate_file(file)));
+ 		retval = -EINVAL;
+diff -uprN ../linux-5.5.5/mm/nommu.c linux-5.5.5/mm/nommu.c
+--- ../linux-5.5.5/mm/nommu.c	2020-02-19 19:54:14.000000000 +0100
++++ linux-5.5.5/mm/nommu.c	2020-05-09 17:50:17.670154336 +0200
+@@ -1334,12 +1334,18 @@ unsigned long ksys_mmap_pgoff(unsigned l
+ 		file = fget(fd);
+ 		if (!file)
+ 			goto out;
++
++		if (file->f_flags & O_BUFFERED_WRITE) {
++			retval = -EPERM;
++			goto out_putf;
++		}
+ 	}
+ 
+ 	flags &= ~(MAP_EXECUTABLE | MAP_DENYWRITE);
+ 
+ 	retval = vm_mmap_pgoff(file, addr, len, prot, flags, pgoff);
+ 
++out_putf:
+ 	if (file)
+ 		fput(file);
+ out:
