@@ -981,7 +981,7 @@ struct file {
 	struct address_space	*f_mapping;
 	errseq_t		f_wb_err;
 
-	struct mutex		f_buffer_mutex;  // TODO rw lock
+	struct mutex		f_buffer_mutex;
 	struct list_head	f_buffer_list;
 	loff_t			f_buffer_end;  // address after all changes
 	unsigned short		f_buffer_truncated;
@@ -995,9 +995,6 @@ struct file_handle {
 	unsigned char f_handle[0];
 };
 
-
-
-// TODO might move
 static inline void init_write_buffer(struct write_buffer *wb)
 {
 	INIT_LIST_HEAD(&wb->buffer_list);
@@ -1007,7 +1004,6 @@ static inline void init_write_buffer(struct write_buffer *wb)
 	wb->flags = 0;
 }
 
-// TODO might move
 static inline void delete_write_buffer(struct write_buffer *write_buffer)
 {
 	list_del(&write_buffer->buffer_list);

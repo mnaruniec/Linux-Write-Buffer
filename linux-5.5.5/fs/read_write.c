@@ -458,7 +458,6 @@ static ssize_t apply_truncate_buffer(struct write_buffer *entry, char *buf, size
 	return got;
 }
 
-// TODO refactor all to min/max
 static ssize_t apply_write_buffer(struct write_buffer *entry, char *buf, size_t cap,
 				ssize_t got, loff_t orig_pos, loff_t *pos)
 {
@@ -1189,29 +1188,26 @@ out:
 }
 #endif
 
-// TODO handle offset != 0
 static int copy_buffer_to_iter(struct iov_iter *iter, char *buf, ssize_t size)
 {
-	ssize_t to_copy;
-	if (iter->iov_offset != 0) {
-		return -EPERM;
-	}
+	ssize_t bytes;
+	char __user *to;
 
 	while (size > 0) {
-		to_copy = min((size_t)size, iter->iov->iov_len);
+		bytes = min((size_t)size, iter->iov->iov_len - iter->iov_offset);
+		to = iter->iov->iov_base + iter->iov_offset;
 
-		if (copy_to_user(iter->iov->iov_base, buf, to_copy))
+		if (copy_to_user(to, buf, bytes))
 			return -1;
 
-		iov_iter_advance(iter, to_copy);
-		size -= to_copy;
-		buf += to_copy;
+		iov_iter_advance(iter, bytes);
+		size -= bytes;
+		buf += bytes;
 	}
 
 	return 0;
 }
 
-// TODO static check & testing
 static ssize_t do_iter_read(struct file *file, struct iov_iter *iter,
 		loff_t *pos, rwf_t flags)
 {
@@ -1396,9 +1392,14 @@ static ssize_t buffer_writev(struct file *file, struct iov_iter *iter,
 	size_t tot_len;
 	ssize_t ret = 0;
 
-	loff_t local_pos = *pos;
+	loff_t local_pos;
 	struct list_head append_head;
 	INIT_LIST_HEAD(&append_head);
+
+	if (!pos)
+		return -ESPIPE;
+
+	local_pos = *pos;
 
 	if (!(file->f_mode & FMODE_WRITE))
 		return -EBADF;

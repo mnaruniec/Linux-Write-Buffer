@@ -118,7 +118,6 @@ static struct file *__alloc_file(int flags, const struct cred *cred)
 	f->f_mode = OPEN_FMODE(flags);
 	/* f->f_version: 0 */
 
-	// TODO verify
 	mutex_init(&f->f_buffer_mutex);
 	INIT_LIST_HEAD(&f->f_buffer_list);
 	f->f_buffer_end = 0;
