@@ -708,34 +708,26 @@ ssize_t kernel_write(struct file *file, const void *buf, size_t count,
 }
 EXPORT_SYMBOL(kernel_write);
 
-static ssize_t buffer_write(struct file *file, const char __user *buf,
-				size_t count, loff_t *pos)
+static ssize_t buffer_interval(struct list_head *append_head,
+			const char __user *buf, size_t count, loff_t *pos,
+			rwf_t flags)
 {
 	ssize_t ret = 0;
-
-	char *local_buf;
-	size_t local_count;
-	loff_t local_pos = *pos;
-
 	size_t left = count;
+	size_t local_count;
+	char *local_buf;
+	loff_t local_pos = *pos;
 	struct write_buffer *wb;
 
-	struct list_head append_head;
-	INIT_LIST_HEAD(&append_head);
-
-	if (!count) {
-		goto out;
-	}
-
 	while (left) {
-		local_count = count > PAGE_SIZE ? PAGE_SIZE : count;
+		local_count = min(PAGE_SIZE, left);
 
 		local_buf = kmalloc(local_count, GFP_KERNEL);
 		if (!local_buf) {
 			ret = -ENOMEM;
-			goto out_free_append_list;
+			goto out;
 		}
-		printk(KERN_ALERT "Alloced buffer in BUFFER_WRITE\n");
+		printk(KERN_ALERT "Alloced buffer in BUFFER_INTERVAL\n");
 
 		if (copy_from_user(local_buf, buf, local_count)) {
 			ret = -EFAULT;
@@ -747,17 +739,53 @@ static ssize_t buffer_write(struct file *file, const char __user *buf,
 			ret = -ENOMEM;
 			goto out_free_local_buffer;
 		}
-		printk(KERN_ALERT "Alloced wb in BUFFER_WRITE\n");
+		printk(KERN_ALERT "Alloced wb in BUFFER_INTERVAL\n");
 
 		init_write_buffer(wb);
 		wb->buffer = local_buf;
 		wb->size = local_count;
-		wb->offset =local_pos;
+		wb->offset = local_pos;
+		wb->flags = flags;
 
-		list_add_tail(&wb->buffer_list, &append_head);
+		list_add_tail(&wb->buffer_list, append_head);
 
 		left -= local_count;
 		local_pos += local_count;
+		buf += local_count;
+	}
+
+	ret = (ssize_t)count;
+	*pos = local_pos;
+
+out:
+	return ret;
+
+out_free_local_buffer:
+	kfree(local_buf);
+	printk(KERN_ALERT "Dealloced buffer in BUFFER_INTERVAL\n");
+	goto out;
+}
+
+// TODO check write len
+static ssize_t buffer_write(struct file *file, const char __user *buf,
+				size_t count, loff_t *pos)
+{
+	ssize_t ret = 0;
+
+	loff_t local_pos = *pos;
+	struct list_head append_head;
+	INIT_LIST_HEAD(&append_head);
+
+	if (!pos)
+		return -ESPIPE;
+
+	if (!count) {
+		goto out;
+	}
+
+	ret = buffer_interval(&append_head, buf, count, &local_pos, 0);
+	if (ret < 0) {
+		goto out_free_append_list;
 	}
 
 	if (mutex_lock_interruptible(&file->f_buffer_mutex)) {
@@ -767,18 +795,16 @@ static ssize_t buffer_write(struct file *file, const char __user *buf,
 
 	list_splice_tail(&append_head, &file->f_buffer_list);
 
+	if (local_pos > file->f_buffer_end)
+		file->f_buffer_end = local_pos;
+
 	mutex_unlock(&file->f_buffer_mutex);
 
 	ret = count;
 	*pos = local_pos;
-	if (*pos > file->f_buffer_end)
-		file->f_buffer_end = *pos;
 out:
 	return ret;
 
-out_free_local_buffer:
-	kfree(local_buf);
-	printk(KERN_ALERT "Dealloced buffer in BUFFER_WRITE\n");
 out_free_append_list:
 	delete_write_buffer_list(&append_head);
 	goto out;
@@ -1163,17 +1189,15 @@ out:
 }
 #endif
 
+// TODO handle offset != 0
 static int copy_buffer_to_iter(struct iov_iter *iter, char *buf, ssize_t size)
 {
 	ssize_t to_copy;
+	if (iter->iov_offset != 0) {
+		return -EPERM;
+	}
 
 	while (size > 0) {
-		// TODO remove
-		if (iter->iov_offset != 0) {
-			printk(KERN_ALERT "MOJE: OFFSET %lu", iter->iov_offset);
-			return -1;
-		}
-
 		to_copy = min((size_t)size, iter->iov->iov_len);
 
 		if (copy_to_user(iter->iov->iov_base, buf, to_copy))
@@ -1366,6 +1390,62 @@ ssize_t kernel_writev_single(struct file *file, const struct kvec *vec,
 	return ret;
 }
 
+static ssize_t buffer_writev(struct file *file, struct iov_iter *iter,
+				loff_t *pos, rwf_t flags)
+{
+	size_t tot_len;
+	ssize_t ret = 0;
+
+	loff_t local_pos = *pos;
+	struct list_head append_head;
+	INIT_LIST_HEAD(&append_head);
+
+	if (!(file->f_mode & FMODE_WRITE))
+		return -EBADF;
+	if (!(file->f_mode & FMODE_CAN_WRITE))
+		return -EINVAL;
+
+	tot_len = iov_iter_count(iter);
+	if (!tot_len)
+		return 0;
+	ret = rw_verify_area(WRITE, file, pos, tot_len);
+	if (ret < 0)
+		return ret;
+
+	while (iter->nr_segs) {
+		ret = buffer_interval(
+			&append_head, iter->iov->iov_base, iter->iov->iov_len,
+			&local_pos, flags
+		);
+		if (ret < 0) {
+			goto out_free_append_list;
+		}
+
+		iov_iter_advance(iter, iter->iov->iov_len);
+	}
+
+	if (mutex_lock_interruptible(&file->f_buffer_mutex)) {
+		ret = -ERESTARTSYS;
+		goto out_free_append_list;
+	}
+
+	list_splice_tail(&append_head, &file->f_buffer_list);
+
+	if (local_pos > file->f_buffer_end)
+		file->f_buffer_end = local_pos;
+
+	mutex_unlock(&file->f_buffer_mutex);
+
+	ret = tot_len;
+	*pos = local_pos;
+out:
+	return ret;
+
+out_free_append_list:
+	delete_write_buffer_list(&append_head);
+	goto out;
+}
+
 static ssize_t vfs_writev(struct file *file, const struct iovec __user *vec,
 		   unsigned long vlen, loff_t *pos, rwf_t flags)
 {
@@ -1376,6 +1456,10 @@ static ssize_t vfs_writev(struct file *file, const struct iovec __user *vec,
 
 	ret = import_iovec(WRITE, vec, vlen, ARRAY_SIZE(iovstack), &iov, &iter);
 	if (ret >= 0) {
+		if (file->f_flags & O_BUFFERED_WRITE) {
+			return buffer_writev(file, &iter, pos, flags);
+		}
+
 		file_start_write(file);
 		ret = do_iter_write(file, &iter, pos, flags);
 		file_end_write(file);
