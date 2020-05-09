@@ -1337,7 +1337,7 @@ unsigned long ksys_mmap_pgoff(unsigned long addr, unsigned long len,
 
 		if (file->f_flags & O_BUFFERED_WRITE) {
 			retval = -EPERM;
-			goto out;
+			goto out_putf;
 		}
 	}
 
@@ -1345,6 +1345,7 @@ unsigned long ksys_mmap_pgoff(unsigned long addr, unsigned long len,
 
 	retval = vm_mmap_pgoff(file, addr, len, prot, flags, pgoff);
 
+out_putf:
 	if (file)
 		fput(file);
 out:
